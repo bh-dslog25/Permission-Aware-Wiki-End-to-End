@@ -97,7 +97,7 @@ export default function PersonaSwitcher({
           <div className="flex items-center gap-2 px-3 pb-2 pt-1.5">
             <ShieldIcon className="h-4 w-4 text-[#28734d]" />
             <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-[#69726b]">
-              Đổi Persona (org.yaml)
+              Đổi tài khoản
             </p>
           </div>
 
@@ -132,7 +132,7 @@ export default function PersonaSwitcher({
           </div>
 
           <p className="mx-2 mt-2 border-t border-[#e6e9e6] px-1 py-2 text-[11px] leading-4 text-[#888f89]">
-            Quyền được phân định nghiêm ngặt theo từng đơn vị trong org.yaml.
+            Quyền được phân định nghiêm ngặt theo từng đơn vị và membership trong cơ sở dữ liệu.
           </p>
         </div>
       )}

@@ -76,32 +76,49 @@ def query_audit_logs(
     params: list[Any] = []
 
     if user_id:
-        clauses.append("user_id = %s")
+        clauses.append("u.user_code = %s")
         params.append(user_id)
     if outcome:
-        clauses.append("outcome = %s")
+        clauses.append("al.metadata->>'outcome' = %s")
         params.append(outcome)
     if since:
-        clauses.append("ts >= %s")
+        clauses.append("al.occurred_at >= %s")
         params.append(since)
     if until:
-        clauses.append("ts <= %s")
+        clauses.append("al.occurred_at <= %s")
         params.append(until)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
-        SELECT id, ts, user_id, context_unit, as_of_date, structured_query,
-               allowed_units, max_classification, authz_decision,
-               retrieved_chunk_ids, source_hashes, outcome, abstain_reason,
-               latency_ms, resolution
-        FROM audit_log
+        SELECT al.audit_id, al.occurred_at, u.user_code, al.resource_id, al.metadata
+        FROM audit_log al
+        LEFT JOIN users u ON u.user_id = al.actor_user_id
         {where_sql}
-        ORDER BY ts DESC
+        ORDER BY al.occurred_at DESC
         LIMIT %s OFFSET %s
     """
     params.extend([limit, offset])
 
     with get_conn() as conn:
         cur = conn.execute(sql, params)
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = cur.fetchall()
+    return [
+        {
+            "id": row[0],
+            "ts": row[1],
+            "user_id": row[2],
+            "context_unit": row[3],
+            "as_of_date": row[4].get("as_of_date"),
+            "structured_query": row[4].get("structured_query"),
+            "allowed_units": row[4].get("allowed_units"),
+            "max_classification": row[4].get("max_classification"),
+            "authz_decision": row[4].get("authz_decision"),
+            "retrieved_chunk_ids": row[4].get("retrieved_chunk_ids"),
+            "source_hashes": row[4].get("source_hashes"),
+            "outcome": row[4].get("outcome"),
+            "abstain_reason": row[4].get("abstain_reason"),
+            "latency_ms": row[4].get("latency_ms"),
+            "resolution": row[4].get("resolution"),
+        }
+        for row in rows
+    ]

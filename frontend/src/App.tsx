@@ -7,7 +7,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const [accounts, setAccounts] = useState<Persona[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("demo123");
+  const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -165,7 +165,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
                 </div>
 
                 <p className="text-center text-xs leading-5 text-[#8a918b]">
-                  Mỗi tài khoản demo tương ứng với một persona khác nhau trong org.yaml để bạn kiểm tra quyền truy cập.
+                  Tài khoản và quyền truy cập được quản lý trong cơ sở dữ liệu.
                 </p>
               </form>
             </div>
@@ -177,21 +177,36 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 }
 
 import OwnerReviewPortal from "./components/OwnerReviewPortal";
+import AdminPortal from "./components/AdminPortal";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [currentView, setCurrentView] = useState<"chat" | "owner">("chat");
+  const [currentView, setCurrentView] = useState<"chat" | "owner" | "admin">("chat");
 
   if (!user) {
     return <LoginPage onLogin={(u) => {
       setUser(u);
-      // Nếu là Knowledge Owner tự động có thể vào owner portal hoặc chat
-      if (u.role === "hr_owner" || u.role === "security") {
+      if (u.role === "security") {
+        setCurrentView("admin");
+      } else if (u.role === "hr_owner") {
         setCurrentView("owner");
       } else {
         setCurrentView("chat");
       }
     }} />;
+  }
+
+  if (currentView === "admin") {
+    return (
+      <AdminPortal
+        user={user}
+        onBackToChat={() => setCurrentView("chat")}
+        onLogout={() => {
+          setUser(null);
+          setCurrentView("chat");
+        }}
+      />
+    );
   }
 
   if (currentView === "owner") {
@@ -215,6 +230,7 @@ export default function App() {
       }}
       user={user}
       onOpenOwnerPortal={() => setCurrentView("owner")}
+      onOpenAdminPortal={() => setCurrentView("admin")}
     />
   );
 }

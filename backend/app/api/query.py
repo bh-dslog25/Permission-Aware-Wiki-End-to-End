@@ -13,6 +13,7 @@ from app.auth import (
     NeedsContextClarification,
     UnknownPersona,
     authenticate_user,
+    change_password,
     context_unit,
     get_persona,
     list_personas,
@@ -31,10 +32,14 @@ class AskRequest(BaseModel):
     as_of: date | None = None
     conversation_id: str | None = None
 
-
 class LoginRequest(BaseModel):
     username_or_email: str
     password: str = ""
+
+class ChangePasswordRequest(BaseModel):
+    username_or_email: str
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
 
 
 def _container(request: Request) -> Any:
@@ -45,10 +50,12 @@ def _container(request: Request) -> Any:
 
 
 def _persona(persona_id: str | None):
+    if not persona_id:
+        raise HTTPException(status_code=401, detail="Yêu cầu đăng nhập")
     try:
-        return get_persona(persona_id or "u_minh_anh")
+        return get_persona(persona_id)
     except UnknownPersona as exc:
-        raise HTTPException(status_code=401, detail="Persona demo không hợp lệ") from exc
+        raise HTTPException(status_code=401, detail="Tài khoản không tồn tại hoặc đã bị vô hiệu hóa") from exc
 
 
 def _serialize_persona(p: Any) -> dict[str, Any]:
@@ -72,23 +79,35 @@ def _serialize_persona(p: Any) -> dict[str, Any]:
 
 @router.get("/personas")
 def get_all_personas() -> list[dict[str, Any]]:
-    """Trả về danh sách tài khoản / persona trực tiếp từ org.yaml."""
-    return [_serialize_persona(p) for p in list_personas() if p.is_persona or p.allowed_contexts]
+    """Return active users and memberships stored in PostgreSQL."""
+    return [_serialize_persona(p) for p in list_personas()]
 
 
 @router.post("/auth/login")
 def login(payload: LoginRequest) -> dict[str, Any]:
-    """Đăng nhập bằng email hoặc username có trong org.yaml."""
+    """Authenticate using the password hash stored for the database user."""
     p = authenticate_user(payload.username_or_email, payload.password)
     if not p:
         raise HTTPException(
             status_code=401,
-            detail="Tài khoản hoặc mật khẩu không chính xác. Vui lòng kiểm tra danh sách tài khoản trong org.yaml.",
+            detail="Tài khoản hoặc mật khẩu không chính xác.",
         )
     return {
         "status": "success",
         "user": _serialize_persona(p),
     }
+
+
+@router.post("/auth/change-password")
+def change_user_password(payload: ChangePasswordRequest) -> dict[str, str]:
+    """Change the account password after verifying its current password."""
+    if not change_password(
+        payload.username_or_email,
+        payload.current_password,
+        payload.new_password,
+    ):
+        raise HTTPException(status_code=401, detail="Thông tin xác thực không chính xác.")
+    return {"status": "success", "message": "Đã đổi mật khẩu."}
 
 
 @router.get("/conversations")
@@ -126,7 +145,7 @@ def me(x_persona_id: str | None = Header(default=None, alias="X-Persona-Id")) ->
         "clearance": p.clearance,
         "role": p.role,
         "contexts": contexts,
-        "personas": [_serialize_persona(item) for item in list_personas() if item.is_persona or item.allowed_contexts],
+        "personas": [_serialize_persona(item) for item in list_personas()],
     }
 
 

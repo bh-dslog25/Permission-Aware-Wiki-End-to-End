@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import audit as audit_api
+from .api import admin as admin_api
 from .api import feedback as feedback_api
 from .api import owner as owner_api
 from .api import query as query_api
@@ -70,6 +71,7 @@ def create_app(*, container: Container | None = None) -> FastAPI:
 
     app.include_router(query_api.router)
     app.include_router(audit_api.router)
+    app.include_router(admin_api.router)
     app.include_router(feedback_api.router)
     app.include_router(owner_api.router)
 

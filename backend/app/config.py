@@ -60,10 +60,6 @@ class Settings(BaseSettings):
         return ROOT_DIR / "data" / "documents"
 
     @property
-    def org_file(self) -> Path:
-        return ROOT_DIR / "data" / "org.yaml"
-
-    @property
     def database_url(self) -> str:
         return (
             f"postgresql://{self.postgres_user}:{self.postgres_password}"

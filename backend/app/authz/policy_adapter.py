@@ -13,12 +13,8 @@ from typing import Any, NamedTuple
 
 import httpx
 
-# Thang độ mật đồng bộ từ models.py (nguồn sự thật duy nhất)
-try:
-    from app.db import CLASSIFICATION_LEVELS
-except ImportError:
-    CLASSIFICATION_LEVELS = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
-from app.auth import load_org, unit_name
+from app.db import CLASSIFICATION_LEVELS, get_conn
+from app.auth import InvalidContext, context_unit as lookup_context_unit, unit_name
 
 DEFAULT_STORE_NAME = "permission-aware-rag-wiki"
 
@@ -85,26 +81,28 @@ class Constraints:
         return SqlFilter(clause, params)
 
 
-def _context_to_unit(context_id: str, org: dict[str, Any]) -> str:
-    unit_ids = {u["id"] for u in org.get("units", [])}
-    if context_id in unit_ids:
-        return context_id
-    for user in org.get("users", []):
-        for membership in user.get("memberships", []):
-            if membership.get("context_id") == context_id:
-                return str(membership["team"])
-    raise ContextNotAssigned(f"Không tìm thấy ngữ cảnh {context_id!r} trong org.yaml")
-
-
-def _unit_chain(unit_id: str, org: dict[str, Any]) -> tuple[str, ...]:
-    by_id = {u["id"]: u for u in org.get("units", [])}
+def _unit_chain(unit_id: str) -> tuple[str, ...]:
     chain: list[str] = []
-    current: str | None = unit_id
-    while current:
-        if current not in by_id:
-            raise ContextNotAssigned(f"Đơn vị {current!r} không tồn tại trong org.yaml")
-        chain.append(current)
-        current = by_id[current].get("parent")
+    seen: set[str] = set()
+    with get_conn() as conn:
+        current = unit_id
+        while current:
+            if current in seen:
+                raise AuthzError(f"Vòng lặp trong cây đơn vị tại {current!r}")
+            seen.add(current)
+            row = conn.execute(
+                """
+                SELECT child.unit_code, parent.unit_code
+                FROM organization_units child
+                LEFT JOIN organization_units parent ON parent.unit_id = child.parent_unit_id
+                WHERE child.unit_code = %s AND child.status = 'active'
+                """,
+                (current,),
+            ).fetchone()
+            if row is None:
+                raise ContextNotAssigned(f"Đơn vị {current!r} không tồn tại hoặc không hoạt động")
+            chain.append(row[0])
+            current = row[1]
     return tuple(reversed(chain))
 
 
@@ -144,11 +142,39 @@ class PolicyAdapter:
 
     def build_constraints(self, *, user_id: str, context_unit: str, clearance: str,
                           as_of: date | None = None) -> Constraints:
-        if clearance not in CLASSIFICATION_LEVELS:
-            raise UnknownClassification(clearance)
+        try:
+            unit_id = lookup_context_unit(context_unit)
+        except InvalidContext as exc:
+            raise ContextNotAssigned(str(exc)) from exc
 
-        org = load_org()
-        unit_id = _context_to_unit(context_unit, org)
+        with get_conn() as conn:
+            assignment = conn.execute(
+                """
+                SELECT r.max_classification
+                FROM users u
+                JOIN memberships m ON m.user_id = u.user_id
+                JOIN organization_units unit ON unit.unit_id = m.unit_id
+                JOIN role_assignments ra ON ra.membership_id = m.membership_id
+                JOIN roles r ON r.role_id = ra.role_id
+                WHERE u.user_code = %s
+                  AND u.status = 'active'
+                  AND m.context_id = %s
+                  AND m.status = 'active'
+                  AND m.valid_from <= now()
+                  AND (m.valid_to IS NULL OR m.valid_to > now())
+                  AND unit.status = 'active'
+                  AND ra.status = 'active'
+                  AND ra.valid_from <= now()
+                  AND (ra.valid_to IS NULL OR ra.valid_to > now())
+                ORDER BY r.max_classification DESC
+                LIMIT 1
+                """,
+                (user_id, context_unit),
+            ).fetchone()
+        if assignment is None:
+            raise ContextNotAssigned(f"{user_id} không có membership/role active cho {context_unit}")
+        max_classification = int(assignment[0])
+
         user = f"user:{user_id}"
         unit = f"unit:{unit_id}"
 
@@ -172,12 +198,12 @@ class PolicyAdapter:
         units = tuple(sorted(o.removeprefix("unit:") for o in res["objects"]))
 
         # 3) ABAC: độ mật tối đa theo clearance
-        chain = _unit_chain(unit_id, org)
+        chain = _unit_chain(unit_id)
         return Constraints(
             user_id,
             context_unit,
             units,
-            CLASSIFICATION_LEVELS[clearance],
+            max_classification,
             as_of or date.today(),
             chain,
             unit_name(unit_id),

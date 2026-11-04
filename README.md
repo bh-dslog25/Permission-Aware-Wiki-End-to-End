@@ -30,7 +30,7 @@ Trong Wiki nội bộ, không phải nhân viên nào cũng được phép truy 
 ### 1.3. MVP Scope
 
 - 30–50 tài liệu Markdown giả lập (có bản cũ/mới/hết hạn/nháp, tài liệu mật, chính sách nhiều cấp).
-- Cây tổ chức nhỏ định nghĩa trong `data/org.yaml`, với 3 tài khoản demo, gồm người dùng có nhiều vai trò.
+- Tài khoản, cây tổ chức, membership và role được lưu trong PostgreSQL; `data/org.yaml` không còn là nguồn runtime.
 - Tài liệu có phạm vi, phân loại và thời gian hiệu lực khác nhau.
 - OpenFGA để kiểm tra quan hệ truy cập (ReBAC); ABAC cho phân loại, hiệu lực và trạng thái.
 - PostgreSQL + pgvector để lưu metadata, chunks, vector embeddings và audit log.
@@ -90,7 +90,7 @@ permission-aware-rag-wiki/
 │   │   │
 │   │   ├── authz/
 │   │   │   ├── model.fga         # Authorization model của OpenFGA
-│   │   │   ├── seed.py           # Nạp org + tuples từ data/org.yaml vào OpenFGA/DB
+│   │   │   ├── seed.py           # Đồng bộ tuples từ PostgreSQL sang OpenFGA
 │   │   │   └── policy_adapter.py # OpenFGA + ABAC -> allowed_units, max_classification
 │   │   │
 │   │   ├── ingest/
@@ -131,7 +131,7 @@ permission-aware-rag-wiki/
 │           └── SourceCard.tsx
 │
 ├── data/
-│   ├── org.yaml                  # Cây tổ chức, memberships, clearance theo role
+│   ├── org.yaml                  # Dữ liệu demo cũ; không được đọc lúc chạy
 │   ├── documents/                # Tài liệu Markdown giả lập (front matter + nội dung)
 │   └── eval/
 │       └── golden.jsonl
@@ -152,7 +152,7 @@ permission-aware-rag-wiki/
 - `auth.py`: giải quyết danh tính và context đang hoạt động.
 - `db.py`: kết nối database và thao tác DB dùng chung.
 - `authz/model.fga`: authorization model của OpenFGA.
-- `authz/seed.py`: nạp dữ liệu tổ chức và tuples từ `data/org.yaml`.
+- `authz/seed.py`: đồng bộ cây đơn vị và memberships đang hiệu lực từ PostgreSQL sang OpenFGA.
 - `authz/policy_adapter.py`: chuyển thông tin quyền thành điều kiện truy vấn an toàn; fail closed khi lỗi.
 - `ingest/ingest.py`: gộp parsing, validate metadata, chunking, embedding và indexing ở quy mô MVP.
 - `rag/pipeline.py`: điều phối các bước RAG.
@@ -162,7 +162,7 @@ permission-aware-rag-wiki/
 - `rag/resolution.py`: xác định phiên bản và quy tắc áp dụng.
 - `rag/generation.py`: tạo câu trả lời, kiểm tra citation và xử lý từ chối.
 - `db/schema.sql`: schema tập trung, tránh tạo bảng rải rác trong code.
-- `data/org.yaml`: nguồn dữ liệu tổ chức, memberships và mức clearance tối đa theo role.
+- `data/org.yaml`: mẫu dữ liệu demo cũ, không phải nguồn dữ liệu runtime.
 
 Không cần tạo file riêng cho từng hàm. Khi một module lớn lên hoặc cần kiểm thử, tái sử dụng độc lập, có thể tách thêm sau.
 
@@ -173,7 +173,7 @@ Không cần tạo file riêng cho từng hàm. Khi một module lớn lên ho�
 Hệ thống gồm 3 lớp chính:
 
 1. **Dữ liệu và vector store:** PostgreSQL + pgvector lưu tài liệu, phiên bản, chunks, embedding, metadata phân quyền và audit log.
-2. **Quyền và xác thực:** OpenFGA quản lý quan hệ ReBAC; org hierarchy và memberships định nghĩa trong `org.yaml`; Policy Adapter kết hợp quyền theo đơn vị, phân loại dữ liệu, thời điểm hỏi và hiệu lực tài liệu.
+2. **Quyền và xác thực:** PostgreSQL lưu tài khoản, cây đơn vị, memberships và role assignments; OpenFGA đánh giá quan hệ ReBAC; Policy Adapter áp dụng clearance, trạng thái và hiệu lực tài liệu theo dữ liệu DB.
 3. **Truy xuất và sinh câu trả lời:** tìm kiếm từ khóa + vector, ràng buộc quyền ngay trong SQL; tài liệu không đủ điều kiện bị loại trước khi đến LLM; kết quả và quyết định truy cập được ghi vào audit log.
 
 ### 4.1. Offline Ingestion Pipeline
@@ -251,7 +251,7 @@ Answer or Abstain
 
 Backend xác định danh tính từ nguồn đáng tin cậy và kiểm tra context người dùng được phép dùng. Người kiêm nhiệm chọn **một** context mỗi lần; quyền không được gộp giữa các context.
 
-Trong MVP, `PersonaSwitcher` chỉ chọn một tài khoản demo đã cấu hình sẵn. Client không được tự khai báo `allowed_units`, quyền đọc hoặc cấp phân loại.
+`PersonaSwitcher` chỉ liệt kê tài khoản active lấy từ database. Client không được tự khai báo `allowed_units`, quyền đọc hoặc cấp phân loại.
 
 #### Step 2 — Query Understanding
 
@@ -298,7 +298,7 @@ Khi bị chặn hoặc không có tài liệu, hệ thống trả cùng một th
 
 ### 5.1. Cây tổ chức và kế thừa
 
-Tổ chức được mô hình hóa: tập đoàn → công ty → phòng ban → nhóm. Ví dụ trong `org.yaml`:
+Tổ chức được mô hình hóa: tập đoàn → công ty → phòng ban → nhóm. Cây đơn vị được lưu trong `organization_units`:
 
 ```text
 A Group
@@ -321,7 +321,7 @@ OpenFGA quản lý quan hệ như user `assigned`/`member_of` đơn vị, team `
 
 ### 5.3. Lớp 2 — ABAC với classification và clearance
 
-Các mức phân loại: `public` < `internal` < `confidential` < `restricted`. Mỗi role có clearance tối đa (định nghĩa trong `org.yaml`), ví dụ:
+Các mức phân loại: `public` < `internal` < `confidential` < `restricted`. Clearance tối đa của role được lưu trong `roles.max_classification`.
 
 | Role | Clearance tối đa |
 |---|---|
@@ -385,7 +385,7 @@ PostgreSQL là nguồn lưu trữ chính. Quan hệ phân quyền được quả
 | `role` | Vai trò (quyết định clearance) |
 | `valid_from` / `valid_to` | Khoảng hiệu lực của membership |
 
-Dữ liệu này được seed từ `org.yaml` và đồng bộ vào OpenFGA. Không dùng riêng bảng này để bỏ qua quyết định của OpenFGA.
+Dữ liệu membership được đọc từ PostgreSQL và đồng bộ vào OpenFGA. Không dùng riêng bảng này để bỏ qua quyết định của OpenFGA.
 
 #### `documents`
 
@@ -547,7 +547,15 @@ Không đủ bằng chứng:
 | `GET` | `/api/v1/me` | Xem identity demo và context hiện tại |
 | `POST` | `/api/v1/feedback` | Ghi nhận phản hồi câu trả lời |
 | `GET` | `/api/v1/audit` | Truy vấn audit log theo quyền của người gọi |
+| `GET` | `/api/v1/admin/users` | Danh sách tài khoản, memberships, đơn vị và role (Admin) |
+| `POST` | `/api/v1/admin/users` | Tạo tài khoản và cấp membership/role ban đầu (Admin) |
+| `PATCH` | `/api/v1/admin/users/{user_code}` | Khóa hoặc mở tài khoản (Admin) |
+| `POST` | `/api/v1/admin/users/{user_code}/memberships` | Cấp thêm quyền theo đơn vị (Admin) |
+| `PATCH` | `/api/v1/admin/memberships/{membership_id}` | Đổi role trên membership (Admin) |
+| `DELETE` | `/api/v1/admin/memberships/{membership_id}` | Thu hồi membership (Admin) |
 | `GET` | `/health` | Kiểm tra tình trạng ứng dụng |
+
+Tài khoản Admin có giao diện quản trị để thực hiện các thao tác trên. API phía server vẫn kiểm tra role `security`; giao diện không thay thế kiểm tra quyền.
 
 Evaluation ưu tiên chạy qua CLI (`backend/scripts/run_eval.py`). Chỉ mở `POST /api/v1/evaluate` khi thật sự cần; endpoint này phải được bảo vệ vì tốn tài nguyên và truy cập dữ liệu kiểm thử.
 
@@ -628,7 +636,7 @@ Lệnh này chỉ khởi chạy các dịch vụ trong `docker-compose.yml` (Pos
 1. Khởi chạy PostgreSQL + pgvector và OpenFGA.
 2. Áp dụng `backend/db/schema.sql` (hoặc `scripts/init_db.py`).
 3. Nạp authorization model `authz/model.fga` vào OpenFGA.
-4. Nạp dữ liệu tổ chức và tuples demo từ `data/org.yaml` (`authz/seed.py`).
+4. Tạo/cấp dữ liệu ban đầu vào PostgreSQL; sau đó đồng bộ tuples hiện hành sang OpenFGA bằng `python -m app.authz.seed`.
 5. Ingest tài liệu Markdown trong `data/documents/`.
 6. Khởi chạy backend và frontend.
 7. Chạy test phân quyền trước khi thử hỏi đáp.
@@ -649,7 +657,7 @@ Giả định `pyproject.toml` đã cấu hình package đúng. Production cần
 
 ### Phase 1 — Foundation
 - Docker Compose, PostgreSQL + pgvector, OpenFGA.
-- Database schema; `org.yaml`, authorization model, identity demo và seed tuples.
+- Database schema; tài khoản, cây tổ chức, role assignments, authorization model và seed tuples.
 - Kiểm thử OpenFGA và Policy Adapter.
 
 ### Phase 2 — Ingestion and Retrieval

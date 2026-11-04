@@ -1,25 +1,20 @@
-"""Xác định persona demo và ngữ cảnh hợp lệ từ cấu hình server (data/org.yaml).
-
-Ref: README Section 3.1 & 4.2 Step 1.
-Frontend chỉ gửi persona_id (+ context_id muốn chọn); quyền thật do OpenFGA
-và Policy Adapter tính toán phía backend.
-"""
+"""Load active user identities and memberships from PostgreSQL."""
 from __future__ import annotations
 
-import os
+import hashlib
+import hmac
+import secrets
 from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
-from typing import Optional
 
-import yaml
+from app.db import CLASSIFICATION_NAMES, get_conn, write_audit
 
-# Đường dẫn mặc định đến file cấu hình tổ chức
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CANDIDATE_ORG_PATHS = [
-    REPO_ROOT / "data" / "org.yaml",
-    REPO_ROOT / "docs" / "org.yaml",
-]
+PERSONA_ALIASES = {
+    "an": "u_minh_anh",
+    "binh": "u_quoc_bao",
+    "chi": "u_thu_ha",
+    "lan": "u_pham_lan",
+}
+PASSWORD_ITERATIONS = 310_000
 
 
 class UnknownPersona(Exception):
@@ -38,9 +33,9 @@ class Persona:
     allowed_contexts: tuple[str, ...]
     role: str = "employee"
     description: str = ""
-    team_id: Optional[str] = None
-    department_id: Optional[str] = None
-    company_id: Optional[str] = None
+    team_id: str | None = None
+    department_id: str | None = None
+    company_id: str | None = None
     email: str = ""
     title: str = ""
     is_persona: bool = True
@@ -55,108 +50,191 @@ class Persona:
         return self.allowed_contexts
 
 
-# Alias phục vụ demo và test suite
-PERSONA_ALIASES = {
-    "an": "u_minh_anh",
-    "binh": "u_quoc_bao",
-    "chi": "u_thu_ha",
-    "lan": "u_pham_lan",
-}
+def _persona_rows(user_code: str | None = None) -> list[Persona]:
+    clauses = ["u.status = 'active'"]
+    params: list[str] = []
+    if user_code is not None:
+        clauses.append("(u.user_code = %s OR u.email = %s)")
+        params.extend((user_code, user_code))
 
-CONTEXT_ALIASES = {
-    "a-kinh-doanh": "ctx_thu_ha_a",
-    "b-ky-thuat": "ctx_thu_ha_b",
-}
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT u.user_code, u.display_name, u.email, u.description,
+                   m.context_id, unit.unit_code, unit.name, unit.unit_type,
+                   membership_role.role_code, membership_role.max_classification,
+                   m.membership_type, m.job_title
+            FROM users u
+            LEFT JOIN memberships m
+              ON m.user_id = u.user_id
+             AND m.status = 'active'
+             AND m.valid_from <= now()
+             AND (m.valid_to IS NULL OR m.valid_to > now())
+             AND EXISTS (
+                 SELECT 1 FROM role_assignments active_ra
+                 WHERE active_ra.membership_id = m.membership_id
+                   AND active_ra.status = 'active'
+                   AND active_ra.valid_from <= now()
+                   AND (active_ra.valid_to IS NULL OR active_ra.valid_to > now())
+             )
+            LEFT JOIN organization_units unit
+              ON unit.unit_id = m.unit_id AND unit.status = 'active'
+            LEFT JOIN LATERAL (
+                SELECT r.role_code, r.max_classification
+                FROM role_assignments ra
+                JOIN roles r ON r.role_id = ra.role_id
+                WHERE ra.membership_id = m.membership_id
+                  AND ra.status = 'active'
+                  AND ra.valid_from <= now()
+                  AND (ra.valid_to IS NULL OR ra.valid_to > now())
+                ORDER BY r.max_classification DESC, r.role_code
+                LIMIT 1
+            ) membership_role ON TRUE
+            WHERE {" AND ".join(clauses)}
+            ORDER BY u.user_code,
+                     CASE m.membership_type WHEN 'primary' THEN 0 ELSE 1 END,
+                     m.context_id
+            """,
+            params,
+        ).fetchall()
 
-
-@lru_cache(maxsize=1)
-def load_org() -> dict:
-    env_path = os.getenv("ORG_FILE")
-    if env_path:
-        p = Path(env_path)
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                return yaml.safe_load(f)
-
-    for p in CANDIDATE_ORG_PATHS:
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                return yaml.safe_load(f)
-
-    raise FileNotFoundError("Không tìm thấy org.yaml tại data/org.yaml hoặc docs/org.yaml")
-
-
-def _generate_email(user_id: str) -> str:
-    # u_minh_anh -> minh.anh@appota.com
-    clean = user_id.removeprefix("u_")
-    parts = clean.split("_")
-    if len(parts) >= 2:
-        return f"{'.'.join(parts)}@appota.com"
-    return f"{clean}@appota.com"
-
-
-def list_personas() -> list[Persona]:
-    org = load_org()
-    role_clearance = org.get("role_clearance", {
-        "employee": "internal",
-        "manager": "confidential",
-        "hr_owner": "confidential",
-        "security": "restricted",
-    })
+    by_user: dict[str, dict] = {}
+    for row in rows:
+        (
+            user_code_value, name, email, description, context_id, unit_code,
+            unit_label, unit_type, role_code, max_classification, membership_type, job_title,
+        ) = row
+        record = by_user.setdefault(
+            user_code_value,
+            {
+                "name": name,
+                "email": email,
+                "description": description,
+                "memberships": [],
+            },
+        )
+        if not context_id or not unit_code:
+            continue
+        record["memberships"].append(
+            {
+                "context_id": context_id,
+                "team": unit_code,
+                "unit_name": unit_label,
+                "unit_type": unit_type,
+                "role": role_code or "employee",
+                "clearance": CLASSIFICATION_NAMES.get(max_classification or 0, "public"),
+                "membership_type": membership_type,
+                "title": job_title,
+            }
+        )
 
     personas: list[Persona] = []
-    for u in org.get("users", []):
-        memberships = u.get("memberships", [])
-        if "contexts" in u:
-            contexts = tuple(u["contexts"])
-        else:
-            contexts = tuple(m.get("context_id", m.get("team")) for m in memberships if m)
-
-        first_role = memberships[0].get("role", "employee") if memberships else "employee"
-        first_title = memberships[0].get("title", "") if memberships else ""
-        clearance = u.get("clearance") or role_clearance.get(first_role, "internal")
-
-        email = u.get("email") or _generate_email(u["id"])
-
-        p = Persona(
-            user_id=u["id"],
-            name=u.get("name", u["id"]),
-            clearance=clearance,
-            allowed_contexts=contexts,
-            role=first_role,
-            description=u.get("description", ""),
-            team_id=memberships[0].get("team") if memberships else None,
-            email=email,
-            title=first_title or u.get("description", ""),
-            is_persona=bool(u.get("persona", True)),
-            memberships=tuple(memberships),
+    for user_code_value, user in by_user.items():
+        memberships = user["memberships"]
+        primary = memberships[0] if memberships else {}
+        personas.append(
+            Persona(
+                user_id=user_code_value,
+                name=user["name"],
+                email=user["email"],
+                description=user["description"],
+                allowed_contexts=tuple(m["context_id"] for m in memberships),
+                memberships=tuple(memberships),
+                role=primary.get("role", "employee"),
+                clearance=primary.get("clearance", "public"),
+                team_id=primary.get("team"),
+                title=primary.get("title", ""),
+                is_persona=True,
+            )
         )
-        personas.append(p)
     return personas
 
 
-def authenticate_user(identifier: str, password: str) -> Persona | None:
-    """Xác thực người dùng theo email hoặc user_id/username trong org.yaml.
-    Mật khẩu mặc định trong demo là 'demo123' hoặc bất kỳ mật khẩu nào được gán trong org.yaml.
-    """
-    clean_id = identifier.strip().lower()
-    aliased_id = PERSONA_ALIASES.get(clean_id, clean_id).lower()
-    for p in list_personas():
-        expected_email = p.email.lower()
-        raw_id = p.user_id.lower()
-        simple_id = p.user_id.removeprefix("u_").lower()
+def list_personas() -> list[Persona]:
+    return _persona_rows()
 
-        if clean_id in (expected_email, raw_id, simple_id) or aliased_id in (raw_id, simple_id):
-            return p
-    return None
+
+def authenticate_user(identifier: str, password: str) -> Persona | None:
+    """Authenticate an active database user using a PBKDF2 password hash."""
+    identifier = PERSONA_ALIASES.get(identifier.strip().lower(), identifier.strip())
+    if not identifier or not password:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT user_code, password_hash
+            FROM users
+            WHERE status = 'active' AND (LOWER(email) = LOWER(%s) OR user_code = %s)
+            """,
+            (identifier, identifier),
+        ).fetchone()
+    if row is None or not row[1]:
+        return None
+    if not verify_password(password, row[1]):
+        return None
+    return get_persona(row[0])
+
+
+def verify_password(password: str, encoded_hash: str) -> bool:
+    try:
+        algorithm, salt, expected = encoded_hash.split("$", 2)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), PASSWORD_ITERATIONS
+        ).hex()
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${salt.hex()}${digest.hex()}"
+
+
+def change_password(identifier: str, current_password: str, new_password: str) -> bool:
+    identifier = PERSONA_ALIASES.get(identifier.strip().lower(), identifier.strip())
+    with get_conn() as conn, conn.transaction():
+        row = conn.execute(
+            """
+            SELECT user_id, user_code, password_hash
+            FROM users
+            WHERE status = 'active'
+              AND (LOWER(email) = LOWER(%s) OR user_code = %s)
+            FOR UPDATE
+            """,
+            (identifier, identifier),
+        ).fetchone()
+        if row is None or not row[2] or not verify_password(current_password, row[2]):
+            return False
+        conn.execute(
+            """
+            UPDATE users
+            SET password_hash = %s, updated_at = now()
+            WHERE user_id = %s
+            """,
+            (hash_password(new_password), row[0]),
+        )
+        write_audit(
+            conn,
+            row[1],
+            structured_query={"type": "password_changed"},
+            authz_decision={"action": "change_password", "decision": "success"},
+            outcome="answered",
+        )
+        return True
 
 
 def get_persona(persona_id: str) -> Persona:
-    normalized_id = PERSONA_ALIASES.get(persona_id, persona_id)
-    for p in list_personas():
-        if p.user_id == normalized_id or p.user_id == persona_id:
-            return p
-    raise UnknownPersona(persona_id)
+    if not persona_id:
+        raise UnknownPersona(persona_id)
+    persona_id = PERSONA_ALIASES.get(persona_id.lower(), persona_id)
+    personas = _persona_rows(persona_id)
+    if not personas:
+        raise UnknownPersona(persona_id)
+    return personas[0]
 
 
 class NeedsContextClarification(Exception):
@@ -166,38 +244,41 @@ class NeedsContextClarification(Exception):
 
 
 def resolve_context(persona: Persona, requested: str | None = None) -> str:
-    """Trả về đúng MỘT ngữ cảnh. Nếu người dùng kiêm nhiệm nhiều ngữ cảnh mà không chỉ định thì yêu cầu làm rõ.
-
-    Quyền chọn ngữ cảnh được OpenFGA kiểm tra lại (quan hệ assigned) trong policy_adapter.
-    """
     if requested is None:
         if len(persona.allowed_contexts) > 1:
             raise NeedsContextClarification(persona.allowed_contexts)
         if not persona.allowed_contexts:
-            raise InvalidContext(f"{persona.user_id} không có ngữ cảnh hợp lệ")
+            raise InvalidContext(f"{persona.user_id} không có membership hợp lệ")
         return persona.allowed_contexts[0]
-
-    normalized_req = CONTEXT_ALIASES.get(requested, requested)
-    if requested not in persona.allowed_contexts and normalized_req not in persona.allowed_contexts:
+    if requested not in persona.allowed_contexts:
         raise InvalidContext(f"{persona.user_id} không được chọn ngữ cảnh {requested}")
-    return requested if requested in persona.allowed_contexts else normalized_req
+    return requested
 
 
 def context_unit(context_id: str) -> str:
-    """Map a demo context_id to the unit/team id it represents."""
-    unit_ids = {u["id"] for u in load_org().get("units", [])}
-    if context_id in unit_ids:
-        return context_id
-    for user in load_org().get("users", []):
-        for membership in user.get("memberships", []):
-            if membership.get("context_id") == context_id:
-                return membership.get("team", context_id)
-    return context_id
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT unit.unit_code
+            FROM memberships m
+            JOIN organization_units unit ON unit.unit_id = m.unit_id
+            WHERE m.context_id = %s
+              AND m.status = 'active'
+              AND unit.status = 'active'
+              AND m.valid_from <= now()
+              AND (m.valid_to IS NULL OR m.valid_to > now())
+            """,
+            (context_id,),
+        ).fetchone()
+    if row is None:
+        raise InvalidContext(f"Không tìm thấy membership hợp lệ cho {context_id!r}")
+    return row[0]
 
 
 def unit_name(unit_id: str) -> str:
-    """Tên hiển thị cho đơn vị tổ chức."""
-    for u in load_org().get("units", []):
-        if u["id"] == unit_id:
-            return u.get("name", unit_id)
-    return unit_id
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM organization_units WHERE unit_code = %s AND status = 'active'",
+            (unit_id,),
+        ).fetchone()
+    return row[0] if row else unit_id

@@ -29,6 +29,7 @@ type ChatPageProps = {
   user: User;
   onLogout: () => void;
   onOpenOwnerPortal?: () => void;
+  onOpenAdminPortal?: () => void;
 };
 
 type ConversationEntry = {
@@ -44,7 +45,7 @@ const suggestions = [
   "Chính sách thưởng Tết năm nay?",
 ];
 
-export default function ChatPage({ user, onLogout, onOpenOwnerPortal }: ChatPageProps) {
+export default function ChatPage({ user, onLogout, onOpenOwnerPortal, onOpenAdminPortal }: ChatPageProps) {
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [activePersona, setActivePersona] = useState<Persona>({
     id: user.id,
@@ -288,6 +289,16 @@ export default function ChatPage({ user, onLogout, onOpenOwnerPortal }: ChatPage
           </div>
 
           <div className="flex items-center gap-2 sm:gap-3">
+            {onOpenAdminPortal && user.role === "security" && (
+              <button
+                onClick={onOpenAdminPortal}
+                className="flex items-center gap-1.5 rounded-xl border border-[#cbe2d3] bg-[#e8f3ed] px-3 py-1.5 text-xs font-bold text-[#165c3a] transition hover:bg-[#d8ecdf]"
+                type="button"
+              >
+                <ShieldIcon className="h-3.5 w-3.5" />
+                Quản trị
+              </button>
+            )}
             {onOpenOwnerPortal && (activePersona.role === "hr_owner" || activePersona.role === "security") && (
               <button
                 onClick={onOpenOwnerPortal}

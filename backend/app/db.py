@@ -4,11 +4,11 @@ Nguồn chuẩn duy nhất (Single Source of Truth) cho schema và khởi tạo 
 Ref: README Section 3.1 & MVP Architecture.
 
 Các bảng chính:
-  1. documents: metadata tài liệu (owner_unit, scope, classification rank 0-3, status, topic, parent_conformance...)
-  2. document_relations: quan hệ phiên bản (supersedes, amends)
-  3. chunks: chunk văn bản + vector embedding + denormalized metadata để lọc index
-  4. audit_log: nhật ký truy vấn append-only
-  5. conversations: lịch sử hỏi đáp gắn với tài khoản demo
+  1. users, organization_units, memberships, roles, role_assignments: danh tính và ReBAC/ABAC
+  2. documents, document_versions, document_version_relations: tài liệu và phiên bản
+  3. chunks: nội dung đã chia đoạn và embedding
+  4. conversations, messages, message_sources: lịch sử hội thoại và citations
+  5. audit_log, ingestion_jobs, authz_outbox: vận hành và audit
 
 CLI:
     python -m app.db init     # tạo schema (idempotent)
@@ -21,6 +21,7 @@ import logging
 import sys
 from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
@@ -34,7 +35,7 @@ from app.config import get_settings
 
 log = logging.getLogger(__name__)
 
-# Độ mật (0..3): đồng bộ với org.yaml rank.
+# Độ mật (0..3): đồng bộ với roles.max_classification.
 CLASSIFICATION_LEVELS: dict[str, int] = {
     "public": 0,
     "internal": 1,
@@ -46,168 +47,55 @@ DOC_STATUSES = ("draft", "active", "superseded", "expired")
 RELATION_TYPES = ("supersedes", "amends")
 ALLOWED_DOC_TYPES = ("policy", "process", "guideline", "faq")
 
-EXPECTED_TABLES = {"documents", "document_relations", "chunks", "audit_log", "conversations"}
+EXPECTED_TABLES = {
+    "users",
+    "organization_units",
+    "memberships",
+    "roles",
+    "role_assignments",
+    "documents",
+    "document_versions",
+    "document_version_relations",
+    "chunks",
+    "conversations",
+    "messages",
+    "message_sources",
+    "audit_log",
+    "ingestion_jobs",
+    "authz_outbox",
+}
 
 
 # -----------------------------------------------------------------------------
 # DDL Schema
 # -----------------------------------------------------------------------------
 def build_schema_sql(embedding_dim: int) -> str:
-    statuses = ", ".join(f"'{s}'" for s in DOC_STATUSES)
-    relations = ", ".join(f"'{r}'" for r in RELATION_TYPES)
-    return f"""
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS unaccent;
-
--- 1. documents
-CREATE TABLE IF NOT EXISTS documents (
-    document_id         TEXT PRIMARY KEY,
-    title               TEXT NOT NULL,
-    doc_type            TEXT NOT NULL DEFAULT 'policy',
-    owner_unit          TEXT NOT NULL,
-    scope               TEXT NOT NULL DEFAULT 'unit',
-    classification      SMALLINT NOT NULL DEFAULT 3 CHECK (classification BETWEEN 0 AND 3),
-    version             TEXT NOT NULL,
-    valid_from          DATE,
-    valid_to            DATE,
-    status              TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ({statuses})),
-    mandatory           BOOLEAN NOT NULL DEFAULT FALSE,
-    approved            BOOLEAN NOT NULL DEFAULT FALSE,
-    topic               TEXT,
-    parent_conformance  TEXT NOT NULL DEFAULT 'unverified'
-                        CHECK (parent_conformance IN ('confirmed', 'unverified', 'conflicting')),
-    source_path         TEXT,
-    content_hash        TEXT,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (valid_to IS NULL OR valid_from IS NULL OR valid_to >= valid_from)
-);
-CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents (owner_unit);
-CREATE INDEX IF NOT EXISTS idx_documents_status ON documents (status);
-CREATE INDEX IF NOT EXISTS idx_documents_topic ON documents (topic);
-
--- 2. document_relations (quan hệ phiên bản: supersedes, amends)
-CREATE TABLE IF NOT EXISTS document_relations (
-    source_document_id  TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-    target_document_id  TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-    relation_type       TEXT NOT NULL CHECK (relation_type IN ({relations})),
-    PRIMARY KEY (source_document_id, target_document_id, relation_type),
-    CHECK (source_document_id <> target_document_id)
-);
-CREATE INDEX IF NOT EXISTS idx_relations_target ON document_relations (target_document_id);
-
--- 3. chunks
-CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id        TEXT PRIMARY KEY,
-    document_id     TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-    chunk_index     INTEGER NOT NULL,
-    section_path    TEXT,
-    content         TEXT NOT NULL,
-    embedding       vector({embedding_dim}),
-    content_tsv     tsvector,
-    -- Metadata sao chép để lọc tại index
-    owner_unit      TEXT NOT NULL,
-    classification  SMALLINT NOT NULL CHECK (classification BETWEEN 0 AND 3),
-    valid_from      DATE,
-    valid_to        DATE,
-    status          TEXT NOT NULL CHECK (status IN ({statuses})),
-    mandatory       BOOLEAN NOT NULL DEFAULT FALSE,
-    approved        BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE (document_id, chunk_index)
-);
-CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks (document_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_filter
-    ON chunks (owner_unit, classification, status, valid_from, valid_to);
-CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON chunks USING gin (content_tsv);
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON chunks USING hnsw (embedding vector_cosine_ops);
-
--- Điền tsvector (tiếng Việt: bỏ dấu + cấu hình 'simple')
-CREATE OR REPLACE FUNCTION chunks_tsv_update() RETURNS trigger AS $$
-BEGIN
-    NEW.content_tsv := to_tsvector(
-        'simple', unaccent(coalesce(NEW.section_path, '') || ' ' || NEW.content)
-    );
-    RETURN NEW;
-END $$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_chunks_tsv ON chunks;
-CREATE TRIGGER trg_chunks_tsv BEFORE INSERT OR UPDATE OF content, section_path
-    ON chunks FOR EACH ROW EXECUTE FUNCTION chunks_tsv_update();
-
--- Đồng bộ metadata từ documents xuống chunks khi document cập nhật
-CREATE OR REPLACE FUNCTION documents_sync_chunks() RETURNS trigger AS $$
-BEGIN
-    NEW.updated_at := now();
-    UPDATE chunks SET
-        owner_unit = NEW.owner_unit,
-        classification = NEW.classification,
-        valid_from = NEW.valid_from,
-        valid_to = NEW.valid_to,
-        status = NEW.status,
-        mandatory = NEW.mandatory,
-        approved = NEW.approved
-    WHERE document_id = NEW.document_id;
-    RETURN NEW;
-END $$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_documents_sync ON documents;
-CREATE TRIGGER trg_documents_sync BEFORE UPDATE ON documents
-    FOR EACH ROW EXECUTE FUNCTION documents_sync_chunks();
-
--- 4. audit_log (append-only)
-CREATE TABLE IF NOT EXISTS audit_log (
-    id                  BIGSERIAL PRIMARY KEY,
-    ts                  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    user_id             TEXT NOT NULL,
-    context_unit        TEXT,
-    question_hash       TEXT,
-    as_of_date          DATE,
-    structured_query    JSONB,
-    allowed_units       TEXT[],
-    max_classification  SMALLINT,
-    authz_decision      JSONB,
-    retrieved_chunk_ids TEXT[],
-    source_hashes       TEXT[],
-    outcome             TEXT NOT NULL CHECK (outcome IN ('answered', 'abstained', 'denied', 'error')),
-    abstain_reason      TEXT,
-    latency_ms          INTEGER,
-    resolution          JSONB
-);
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log (user_id, ts DESC);
-
--- Bất biến: audit_log chỉ cho INSERT
-CREATE OR REPLACE FUNCTION audit_log_immutable() RETURNS trigger AS $$
-BEGIN
-    RAISE EXCEPTION 'audit_log là append-only: không được sửa hoặc xóa';
-END $$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_audit_immutable ON audit_log;
-CREATE TRIGGER trg_audit_immutable BEFORE UPDATE OR DELETE ON audit_log
-    FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();
-
--- 5. conversations (lịch sử hội thoại theo persona)
-CREATE TABLE IF NOT EXISTS conversations (
-    conversation_id TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL,
-    title           TEXT NOT NULL,
-    context_id      TEXT NOT NULL,
-    messages        JSONB NOT NULL DEFAULT '[]'::jsonb,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
-    ON conversations (user_id, updated_at DESC);
-"""
+    """Load the canonical PostgreSQL schema from backend/db/schema.sql."""
+    schema_file = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
+    schema = schema_file.read_text(encoding="utf-8")
+    if f"VECTOR({embedding_dim})" not in schema.upper():
+        raise ValueError(
+            f"EMBEDDING_DIM={embedding_dim} does not match vector dimension in {schema_file}"
+        )
+    return schema
 
 
 RESET_SQL = """
+DROP TABLE IF EXISTS authz_outbox CASCADE;
+DROP TABLE IF EXISTS ingestion_jobs CASCADE;
 DROP TABLE IF EXISTS audit_log CASCADE;
+DROP TABLE IF EXISTS message_sources CASCADE;
+DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS conversations CASCADE;
 DROP TABLE IF EXISTS chunks CASCADE;
-DROP TABLE IF EXISTS document_relations CASCADE;
+DROP TABLE IF EXISTS document_version_relations CASCADE;
+DROP TABLE IF EXISTS document_versions CASCADE;
 DROP TABLE IF EXISTS documents CASCADE;
+DROP TABLE IF EXISTS role_assignments CASCADE;
+DROP TABLE IF EXISTS roles CASCADE;
+DROP TABLE IF EXISTS memberships CASCADE;
+DROP TABLE IF EXISTS organization_units CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
 """
 
 
@@ -253,13 +141,36 @@ def get_conn() -> Iterator[psycopg.Connection]:
 # Schema Management
 # -----------------------------------------------------------------------------
 def init_schema(reset: bool = False) -> None:
-    """Tạo schema PostgreSQL (idempotent)."""
+    """Apply the canonical database schema without seeding mock identities."""
     s = get_settings()
     with psycopg.connect(s.database_url, autocommit=True) as conn:
         if reset:
-            conn.execute(RESET_SQL)
-        conn.execute(build_schema_sql(s.embedding_dim))
-    log.info("Schema MVP đã sẵn sàng (embedding_dim=%s)", s.embedding_dim)
+            conn.execute(RESET_SQL, prepare=False)
+        else:
+            has_documents = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'documents'
+                )
+                """
+            ).fetchone()[0]
+            has_document_code = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'documents'
+                      AND column_name = 'document_code'
+                )
+                """
+            ).fetchone()[0]
+            if has_documents and not has_document_code:
+                raise RuntimeError(
+                    "Legacy database schema detected. Back up and migrate the existing "
+                    "database before applying backend/db/schema.sql; use reset only in dev."
+                )
+        conn.execute(build_schema_sql(s.embedding_dim), prepare=False)
+    log.info("Database schema ready (embedding_dim=%s)", s.embedding_dim)
 
 
 # -----------------------------------------------------------------------------
@@ -283,32 +194,56 @@ def write_audit(
     latency_ms: int | None = None,
     resolution: dict | None = None,
 ) -> None:
-    """Ghi nhận bản ghi append-only vào audit_log."""
-    sql = """
-        INSERT INTO audit_log (
-            user_id, context_unit, question_hash, as_of_date, structured_query,
-            allowed_units, max_classification, authz_decision, retrieved_chunk_ids,
-            source_hashes, outcome, abstain_reason, latency_ms, resolution
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
+    """Write an append-only event using the normalized audit schema."""
+    outcome_to_decision = {
+        "answered": "allow",
+        "abstained": "deny",
+        "denied": "deny",
+        "error": "failure",
+    }
+    request_id = (authz_decision or {}).get("request_id")
+    try:
+        from uuid import UUID
+
+        request_id = UUID(str(request_id)) if request_id else None
+    except ValueError:
+        request_id = None
+
+    metadata = {
+        "context_unit": context_unit,
+        "question_hash": question_hash,
+        "as_of_date": as_of_date.isoformat() if as_of_date else None,
+        "structured_query": structured_query,
+        "allowed_units": allowed_units,
+        "max_classification": max_classification,
+        "authz_decision": authz_decision,
+        "retrieved_chunk_ids": retrieved_chunk_ids or [],
+        "source_hashes": source_hashes or [],
+        "outcome": outcome,
+        "abstain_reason": abstain_reason,
+        "latency_ms": latency_ms,
+        "resolution": resolution,
+    }
     conn.execute(
-        sql,
+        """
+        INSERT INTO audit_log (
+            request_id, actor_user_id, event_type, resource_type, resource_id,
+            decision, reason_code, metadata
+        )
+        VALUES (
+            %s,
+            (SELECT user_id FROM users WHERE user_code = %s),
+            %s, 'unit', %s, %s, %s, %s
+        )
+        """,
         (
+            request_id,
             user_id,
+            (structured_query or {}).get("type", "rag_query"),
             context_unit,
-            question_hash,
-            as_of_date,
-            Jsonb(structured_query) if structured_query is not None else None,
-            allowed_units,
-            max_classification,
-            Jsonb(authz_decision) if authz_decision is not None else None,
-            retrieved_chunk_ids,
-            source_hashes,
-            outcome,
+            outcome_to_decision.get(outcome, "failure"),
             abstain_reason,
-            latency_ms,
-            Jsonb(resolution) if resolution is not None else None,
+            Jsonb(metadata),
         ),
     )
 
@@ -353,7 +288,7 @@ def check_db() -> dict:
                 "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
             )
         }
-    missing_ext = {"vector", "unaccent"} - exts
+    missing_ext = {"vector", "unaccent", "btree_gist"} - exts
     missing_tables = EXPECTED_TABLES - tables
     ok = not missing_ext and not missing_tables
     return {

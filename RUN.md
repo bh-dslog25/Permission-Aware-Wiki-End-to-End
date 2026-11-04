@@ -67,13 +67,27 @@ pip install -e ".[ml]"
 
 Sau đó kiểm tra file `.env` hoặc file cấu hình backend để đảm bảo khớp với Docker DB.
 
-Khởi tạo/cập nhật schema (lệnh này idempotent, không xóa dữ liệu hiện có):
+Khởi tạo/cập nhật schema (lệnh này idempotent, không xóa dữ liệu hiện có). Cơ sở dữ liệu cũ không tự động được migrate; hãy sao lưu và xử lý migration trước khi chạy:
 
 ```powershell
 python -m app.db init
 ```
 
-Chạy lệnh này sau khi cập nhật backend để tạo bảng lịch sử hội thoại nếu database đã tồn tại.
+Schema tạo các bảng và role mặc định, không nạp tài khoản, đơn vị hay membership demo. Hãy provision cây đơn vị và tài khoản quản trị ban đầu bằng quy trình quản trị database của bạn; sau đó tạo tài khoản và cấp membership qua API quản trị. Không dùng `data/org.yaml` làm nguồn runtime.
+
+Với database mới, tạo tài khoản quản trị cố định `admin` (email `admin@permission-aware-wiki.local`) bằng lệnh bootstrap. Mật khẩu được nhập ẩn, không truyền qua command line và phải dài ít nhất 12 ký tự:
+
+```powershell
+python -m app.authz.bootstrap
+```
+
+Lệnh này chỉ tạo tài khoản một lần, không ghi đè tài khoản `admin` hoặc khi đã có security admin active. Sau khi đăng nhập, có thể đổi mật khẩu qua `POST /api/v1/auth/change-password` bằng cách gửi `username_or_email`, `current_password` và `new_password` (ít nhất 12 ký tự). Sau đó thêm các đơn vị tổ chức còn lại vào `organization_units` và tạo user/membership tiếp theo qua API quản trị.
+
+Đồng bộ quan hệ ReBAC từ PostgreSQL sang OpenFGA (lệnh seed tạo lại store đã cấu hình):
+
+```powershell
+python -m app.authz.seed
+```
 
 ## 4. Chạy backend
 
@@ -114,7 +128,7 @@ docker compose up -d
 
 ## 8. Ghi chú
 
-- Nếu PostgreSQL khởi động lỗi do volume cũ, nên xóa volume bằng `docker compose down -v`.
+- Nếu PostgreSQL khởi động lỗi do volume cũ, chỉ xóa volume bằng `docker compose down -v` khi chắc chắn dữ liệu có thể bị xóa.
 - Nếu OpenFGA báo database không tồn tại, hãy đảm bảo Docker đã bắt đầu đầy đủ và script init đã chạy.
 - Nếu backend báo thiếu dependency, cài lại bằng `pip install -e .` hoặc `pip install -e ".[ml]"` nếu cần chạy ingest/embedding.
 

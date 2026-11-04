@@ -22,13 +22,15 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import yaml
+from psycopg.types.json import Jsonb
 
 from app.config import Settings, get_settings
 from app.db import (
@@ -89,16 +91,19 @@ class ParsedDocument:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2. Tham chiếu tổ chức (org.yaml)
+# 2. Tham chiếu tổ chức từ database
 # ════════════════════════════════════════════════════════════════════════════
-def load_org_reference(path: Path) -> dict[str, Any]:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    units = data["units"]
+def load_organization_reference() -> dict[str, Any]:
+    with get_conn() as conn:
+        units = conn.execute(
+            "SELECT unit_code, unit_type FROM organization_units WHERE status = 'active'"
+        ).fetchall()
+        if not units:
+            raise RuntimeError("Chưa có organization units trong database")
     return {
-        "unit_ids": frozenset(u["id"] for u in units),
-        "unit_types": {u["id"]: u["type"] for u in units},
-        "classification_rank": {c["id"]: int(c["rank"]) for c in data.get("classifications", [])}
-        or CLASSIFICATION_LEVELS,
+        "unit_ids": frozenset(unit_code for unit_code, _ in units),
+        "unit_types": {unit_code: unit_type for unit_code, unit_type in units},
+        "classification_rank": CLASSIFICATION_LEVELS,
     }
 
 
@@ -170,7 +175,7 @@ def validate_meta(raw: dict[str, Any], stem: str, org: dict[str, Any]) -> tuple[
         issues.append(Issue("E_ID_MISMATCH", f"document_id '{doc_id}' phải trùng tên file '{stem}.md'"))
 
     if s("owner_unit") not in org["unit_ids"]:
-        issues.append(Issue("E_UNKNOWN_UNIT", f"owner_unit='{s('owner_unit')}' không có trong org.yaml"))
+        issues.append(Issue("E_UNKNOWN_UNIT", f"owner_unit='{s('owner_unit')}' không có trong database"))
     elif s("scope") != org["unit_types"].get(s("owner_unit")):
         issues.append(Issue(
             "E_SCOPE_MISMATCH",
@@ -419,7 +424,7 @@ def scan_documents(settings: Settings, *, today: date | None = None, max_chars: 
     root = settings.documents_dir
     if not root.is_dir():
         raise FileNotFoundError(f"Không tìm thấy thư mục tài liệu: {root}")
-    org = load_org_reference(settings.org_file)
+    org = load_organization_reference()
     today = today or date.today()
     files = sorted(p for p in root.rglob("*.md") if not p.name.startswith("_") and p.name.lower() != "readme.md")
     docs = [parse_document(p, root, org, max_chars=max_chars or settings.max_chunk_chars, today=today) for p in files]
@@ -483,49 +488,38 @@ def embedding_text(meta: dict[str, Any], chunk: dict[str, Any]) -> str:
 # 7. Persistence (ghi PostgreSQL trong 1 transaction)
 # ════════════════════════════════════════════════════════════════════════════
 _UPSERT_DOC = """
-INSERT INTO documents (
-    document_id, title, doc_type, owner_unit, scope, classification,
-    version, valid_from, valid_to, status, mandatory, approved,
-    topic, parent_conformance, source_path, content_hash
-)
-VALUES (
-    %(document_id)s, %(title)s, %(doc_type)s, %(owner_unit)s, %(scope)s, %(classification)s,
-    %(version)s, %(valid_from)s, %(valid_to)s, %(status)s, %(mandatory)s, %(approved)s,
-    %(topic)s, %(parent_conformance)s, %(source_path)s, %(content_hash)s
-)
-ON CONFLICT (document_id) DO UPDATE SET
-    title = EXCLUDED.title,
-    doc_type = EXCLUDED.doc_type,
-    owner_unit = EXCLUDED.owner_unit,
-    scope = EXCLUDED.scope,
-    classification = EXCLUDED.classification,
-    version = EXCLUDED.version,
-    valid_from = EXCLUDED.valid_from,
-    valid_to = EXCLUDED.valid_to,
-    status = EXCLUDED.status,
-    mandatory = EXCLUDED.mandatory,
-    approved = EXCLUDED.approved,
-    topic = EXCLUDED.topic,
-    parent_conformance = EXCLUDED.parent_conformance,
-    source_path = EXCLUDED.source_path,
-    content_hash = EXCLUDED.content_hash;
+INSERT INTO documents (document_code)
+VALUES (%(document_code)s)
+ON CONFLICT (document_code) DO NOTHING;
 """
 
 _INSERT_RELATION = """
-INSERT INTO document_relations (source_document_id, target_document_id, relation_type)
-VALUES (%(source)s, %(target)s, %(rel)s)
+INSERT INTO document_version_relations (
+    source_version_id, target_version_id, relation_type
+)
+SELECT source.version_id, target.version_id, %(rel)s
+FROM document_versions source
+JOIN documents source_doc ON source_doc.document_id = source.document_id
+JOIN document_versions target ON target.version_label = %(target_version)s
+JOIN documents target_doc ON target_doc.document_id = target.document_id
+WHERE source_doc.document_code = %(source)s
+  AND source.version_label = %(source_version)s
+  AND target_doc.document_code = %(target)s
 ON CONFLICT DO NOTHING;
 """
 
 _INSERT_CHUNK = """
 INSERT INTO chunks (
-    chunk_id, document_id, chunk_index, section_path, content, embedding,
-    owner_unit, classification, valid_from, valid_to, status, mandatory, approved
+    chunk_id, version_id, chunk_index, section_path, content, embedding
 )
 VALUES (
-    %(chunk_id)s, %(document_id)s, %(chunk_index)s, %(section_path)s, %(content)s, %(embedding)s,
-    %(owner_unit)s, %(classification)s, %(valid_from)s, %(valid_to)s, %(status)s, %(mandatory)s, %(approved)s
-);
+    %(chunk_id)s, %(version_id)s, %(chunk_index)s, %(section_path)s, %(content)s, %(embedding)s
+)
+ON CONFLICT (version_id, chunk_index) DO UPDATE SET
+    section_path = EXCLUDED.section_path,
+    content = EXCLUDED.content,
+    embedding = EXCLUDED.embedding,
+    is_active = TRUE;
 """
 
 
@@ -543,51 +537,87 @@ def _persist_document(
     # Historical versions still need to be retrievable for as-of questions; draft is excluded.
     is_approved = m["status"] != "draft"
 
-    doc_row = {
-        "document_id": doc_id,
-        "title": m["title"],
-        "doc_type": m["doc_type"],
-        "owner_unit": m["owner_unit"],
-        "scope": m["scope"],
-        "classification": m["classification"],
-        "version": m["version"],
-        "valid_from": m["effective_from"],
-        "valid_to": m["effective_to"],
-        "status": m["status"],
-        "mandatory": m["mandatory"],
-        "approved": is_approved,
-        "topic": m["topic"],
-        "parent_conformance": m["parent_conformance"],
-        "source_path": pd.source_path,
-        "content_hash": pd.content_hash,
-    }
-
     chunk_rows = [
         {
-            "chunk_id": c["chunk_id"],
-            "document_id": doc_id,
+            "chunk_id": uuid.uuid5(uuid.NAMESPACE_URL, f"{doc_id}:{m['version']}:{c['chunk_index']}"),
             "chunk_index": c["chunk_index"],
             "section_path": c["section_path"],
             "content": c["text"],
             "embedding": Vector(vec),
-            "owner_unit": m["owner_unit"],
-            "classification": m["classification"],
-            "valid_from": m["effective_from"],
-            "valid_to": m["effective_to"],
-            "status": m["status"],
-            "mandatory": m["mandatory"],
-            "approved": is_approved,
         }
         for c, vec in zip(pd.chunks, vectors)
     ]
 
     with conn.transaction():
-        # Xóa bản cũ của document nếu khác document_id nhưng cùng file
-        conn.execute("DELETE FROM documents WHERE source_path = %s AND document_id <> %s", (pd.source_path, doc_id))
-        conn.execute(_UPSERT_DOC, doc_row)
+        conn.execute(_UPSERT_DOC, {"document_code": doc_id})
+        document_id = conn.execute(
+            "SELECT document_id FROM documents WHERE document_code = %s", (doc_id,)
+        ).fetchone()[0]
+        owner_unit_id = conn.execute(
+            "SELECT unit_id FROM organization_units WHERE unit_code = %s",
+            (m["owner_unit"],),
+        ).fetchone()
+        if owner_unit_id is None:
+            raise ValueError(f"Unknown owner unit {m['owner_unit']!r}")
 
-        # Thay thế toàn bộ chunk của tài liệu này
-        conn.execute("DELETE FROM chunks WHERE document_id = %s", (doc_id,))
+        valid_from = datetime.combine(m["effective_from"], datetime_time.min, timezone.utc)
+        valid_to = (
+            datetime.combine(m["effective_to"], datetime_time.max, timezone.utc)
+            if m["effective_to"] else None
+        )
+        stored_status = "published" if m["status"] == "active" else m["status"]
+        scope_type = "organization" if m["scope"] in {"group", "organization"} else "unit"
+        version_row = conn.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_label, title, doc_type, owner_unit_id, scope,
+                scope_type, classification, status, valid_from, valid_to, mandatory,
+                topic, parent_conformance, policy_values, approved, source_path,
+                source_object_key, content_hash
+            )
+            VALUES (
+                %(document_id)s, %(version)s, %(title)s, %(doc_type)s, %(owner_unit_id)s,
+                %(scope)s, %(scope_type)s, %(classification)s, %(status)s, %(valid_from)s,
+                %(valid_to)s, %(mandatory)s, %(topic)s, %(parent_conformance)s,
+                %(policy_values)s, %(approved)s, %(source_path)s, %(source_object_key)s,
+                %(content_hash)s
+            )
+            ON CONFLICT (document_id, version_label) DO UPDATE SET
+                title = EXCLUDED.title,
+                doc_type = EXCLUDED.doc_type,
+                owner_unit_id = EXCLUDED.owner_unit_id,
+                scope = EXCLUDED.scope,
+                scope_type = EXCLUDED.scope_type,
+                classification = EXCLUDED.classification,
+                status = EXCLUDED.status,
+                valid_from = EXCLUDED.valid_from,
+                valid_to = EXCLUDED.valid_to,
+                mandatory = EXCLUDED.mandatory,
+                topic = EXCLUDED.topic,
+                parent_conformance = EXCLUDED.parent_conformance,
+                policy_values = EXCLUDED.policy_values,
+                approved = EXCLUDED.approved,
+                source_path = EXCLUDED.source_path,
+                source_object_key = EXCLUDED.source_object_key,
+                content_hash = EXCLUDED.content_hash,
+                updated_at = now()
+            RETURNING version_id
+            """,
+            {
+                "document_id": document_id,
+                "version": m["version"],
+                "owner_unit_id": owner_unit_id[0],
+                "scope_type": scope_type,
+                "status": stored_status,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "policy_values": Jsonb(m.get("policy_values") or {}),
+                "source_object_key": pd.source_path,
+            },
+        ).fetchone()[0]
+        conn.execute("UPDATE chunks SET is_active = FALSE WHERE version_id = %s", (version_row,))
+        for row in chunk_rows:
+            row["version_id"] = version_row
         with conn.cursor() as cur:
             cur.executemany(_INSERT_CHUNK, chunk_rows)
 
@@ -600,11 +630,44 @@ def _persist_relations(conn: Any, docs: Sequence[ParsedDocument]) -> None:
             if not m:
                 continue
             doc_id = m["document_id"]
-            conn.execute("DELETE FROM document_relations WHERE source_document_id = %s", (doc_id,))
+            conn.execute(
+                """
+                DELETE FROM document_version_relations
+                WHERE source_version_id = (
+                    SELECT v.version_id FROM document_versions v
+                    JOIN documents d ON d.document_id = v.document_id
+                    WHERE d.document_code = %s AND v.version_label = %s
+                )
+                """,
+                (doc_id, m["version"]),
+            )
             for sup in m.get("supersedes", []):
-                conn.execute(_INSERT_RELATION, {"source": doc_id, "target": sup, "rel": "supersedes"})
+                conn.execute(
+                    _INSERT_RELATION,
+                    {
+                        "source": doc_id,
+                        "source_version": m["version"],
+                        "target": sup,
+                        "target_version": _document_version(docs, sup),
+                    },
+                )
             for amd in m.get("amends", []):
-                conn.execute(_INSERT_RELATION, {"source": doc_id, "target": amd, "rel": "amends"})
+                conn.execute(
+                    _INSERT_RELATION,
+                    {
+                        "source": doc_id,
+                        "source_version": m["version"],
+                        "target": amd,
+                        "target_version": _document_version(docs, amd),
+                    },
+                )
+
+
+def _document_version(docs: Sequence[ParsedDocument], document_id: str) -> str:
+    for doc in docs:
+        if doc.meta and doc.meta["document_id"] == document_id:
+            return doc.meta["version"]
+    raise ValueError(f"Unknown document reference {document_id!r}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -655,10 +718,24 @@ def run_ingest(
         # Fail-closed: vô hiệu hóa tài liệu lỗi đã từng được nạp
         for d in rejected:
             with conn.transaction():
-                conn.execute("UPDATE documents SET approved = FALSE WHERE document_id = %s", (d.doc_id,))
+                conn.execute(
+                    """
+                    UPDATE document_versions v SET approved = FALSE
+                    FROM documents d
+                    WHERE d.document_id = v.document_id AND d.document_code = %s
+                    """,
+                    (d.doc_id,),
+                )
 
         # Lọc tài liệu cần nạp (bỏ qua nếu content_hash không đổi)
-        existing_hashes = dict(conn.execute("SELECT document_id, content_hash FROM documents").fetchall())
+        existing_hashes = dict(conn.execute(
+            """
+            SELECT DISTINCT ON (d.document_code) d.document_code, v.content_hash
+            FROM documents d
+            JOIN document_versions v ON v.document_id = d.document_id
+            ORDER BY d.document_code, v.updated_at DESC
+            """
+        ).fetchall())
 
         pending: list[ParsedDocument] = []
         for d in accepted:
@@ -680,7 +757,7 @@ def run_ingest(
                 stats["chunks_written"] += n
                 log.info("OK    %s (%d chunk)", d.source_path, n)
 
-            _persist_relations(conn, pending)
+            _persist_relations(conn, accepted)
 
     stats["duration_s"] = round(time.monotonic() - started, 2)
     return stats

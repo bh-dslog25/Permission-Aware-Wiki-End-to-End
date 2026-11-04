@@ -244,12 +244,129 @@ export async function authenticate(identifier: string, password: string): Promis
   if (!response.ok) {
     const errorBody = await response.json().catch(() => ({}));
     throw new Error(
-      errorBody.detail || "Đăng nhập không thành công. Hãy kiểm tra tài khoản trong org.yaml.",
+      errorBody.detail || "Đăng nhập không thành công. Hãy kiểm tra tài khoản trong hệ thống.",
     );
   }
 
   const result = (await response.json()) as { status: string; user: BackendPersona };
   return toUser(result.user);
+}
+
+export type AdminRole = { role_code: string; role_name: string };
+export type AdminUnit = { unit_code: string; name: string };
+export type AdminMembership = {
+  membership_id: string;
+  context_id: string;
+  membership_type: "primary" | "matrix" | "project";
+  status: "active" | "inactive";
+  valid_from: string | null;
+  valid_to: string | null;
+  job_title: string;
+  unit_code: string;
+  unit_name: string;
+  roles: Array<{ role_code: string; role_name: string; status: string }>;
+};
+export type AdminUser = {
+  user_code: string;
+  display_name: string;
+  email: string;
+  status: "active" | "disabled";
+  memberships: AdminMembership[];
+};
+export type AdminDirectory = {
+  items: AdminUser[];
+  units: AdminUnit[];
+  roles: AdminRole[];
+};
+
+async function adminRequest<T>(
+  path: string,
+  userId: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/admin${path}`, {
+    ...init,
+    headers: {
+      "X-Persona-Id": userId,
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail ?? "Không thể thực hiện thao tác quản trị.");
+  }
+  return (await response.json()) as T;
+}
+
+export function fetchAdminDirectory(userId: string): Promise<AdminDirectory> {
+  return adminRequest<AdminDirectory>("/users", userId);
+}
+
+export function createAdminUser(
+  userId: string,
+  payload: {
+    user_code: string;
+    display_name: string;
+    email: string;
+    password: string;
+    context_id: string;
+    unit_code: string;
+    role_code: string;
+    job_title: string;
+    membership_type: "primary" | "matrix" | "project";
+  },
+): Promise<{ user_code: string }> {
+  return adminRequest("/users", userId, { method: "POST", body: JSON.stringify(payload) });
+}
+
+export function setAdminUserStatus(
+  userId: string,
+  targetUserCode: string,
+  status: "active" | "disabled",
+): Promise<{ user_code: string; status: string }> {
+  return adminRequest(`/users/${encodeURIComponent(targetUserCode)}`, userId, {
+    method: "PATCH",
+    body: JSON.stringify({ status }),
+  });
+}
+
+export function addAdminMembership(
+  userId: string,
+  targetUserCode: string,
+  payload: {
+    context_id: string;
+    unit_code: string;
+    role_code: string;
+    job_title: string;
+    membership_type: "primary" | "matrix" | "project";
+  },
+): Promise<{ membership_id: string }> {
+  return adminRequest(
+    `/users/${encodeURIComponent(targetUserCode)}/memberships`,
+    userId,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function changeAdminMembershipRole(
+  userId: string,
+  membershipId: string,
+  roleCode: string,
+): Promise<{ membership_id: string; role_code: string }> {
+  return adminRequest(`/memberships/${encodeURIComponent(membershipId)}`, userId, {
+    method: "PATCH",
+    body: JSON.stringify({ role_code: roleCode }),
+  });
+}
+
+export function revokeAdminMembership(
+  userId: string,
+  membershipId: string,
+): Promise<{ membership_id: string }> {
+  return adminRequest(`/memberships/${encodeURIComponent(membershipId)}`, userId, {
+    method: "DELETE",
+  });
 }
 
 function formatTime() {

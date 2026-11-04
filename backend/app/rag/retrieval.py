@@ -1,7 +1,6 @@
 """Step 4 - Constrained hybrid retrieval.
 
-Schema MVP 4 bang: documents, chunks, document_relations, audit_log.
-Khong co document_versions -- quan he phien ban di qua document_relations.
+Retrieval against normalized document versions and chunks.
 
 Module nay chi dung thu vien chuan; DB, embedder, reranker duoc inject qua Protocol.
 """
@@ -99,7 +98,7 @@ class Candidate:
     valid_to: date | None
     doc_status: str             # status trong documents
     mandatory: bool
-    # Quan he phien ban tu document_relations (co the None)
+    # Quan he phien ban tu document_version_relations (co the None)
     superseded_by: str | None = None
     amended_by: str | None = None
     parent_conformance: str | None = None  # confirmed | unverified | conflicting
@@ -146,49 +145,56 @@ class RetrievalResult:
 
 # --------------------------------------------------------------------------- #
 # SQL - moi tham so di qua named params; khong noi chuoi du lieu nguoi dung.
-# Schema MVP: documents + chunks + document_relations (LEFT JOIN).
+# Normalized schema: documents, document_versions, document_version_relations, chunks.
 # --------------------------------------------------------------------------- #
 _SELECT = """
 SELECT
     c.chunk_id,
-    c.document_id,
+    d.document_code AS document_id,
     c.chunk_index,
     c.content,
-    c.valid_from,
-    c.valid_to,
-    c.status,
-    c.mandatory,
-    c.owner_unit,
-    c.classification,
-    d.title,
-    d.scope,
-    d.topic,
-    d.doc_type,
-    d.version,
-    d.content_hash,
-    d.parent_conformance,
-    sup.source_document_id AS superseded_by,
-    amd.source_document_id AS amended_by
+    v.valid_from::date AS valid_from,
+    v.valid_to::date AS valid_to,
+    CASE v.status WHEN 'published' THEN 'active' ELSE v.status END AS status,
+    v.mandatory,
+    owner.unit_code AS owner_unit,
+    v.classification,
+    v.title,
+    v.scope,
+    v.topic,
+    v.doc_type,
+    v.version_label AS version,
+    v.content_hash,
+    v.parent_conformance,
+    v.policy_values,
+    sup_doc.document_code AS superseded_by,
+    amd_doc.document_code AS amended_by
     {extra_cols}
 FROM chunks c
-JOIN documents d ON d.document_id = c.document_id
-LEFT JOIN document_relations sup
-    ON sup.target_document_id = c.document_id AND sup.relation_type = 'supersedes'
-LEFT JOIN document_relations amd
-    ON amd.target_document_id = c.document_id AND amd.relation_type = 'amends'
+JOIN document_versions v ON v.version_id = c.version_id
+JOIN documents d ON d.document_id = v.document_id
+JOIN organization_units owner ON owner.unit_id = v.owner_unit_id
+LEFT JOIN document_version_relations sup
+    ON sup.target_version_id = v.version_id AND sup.relation_type = 'supersedes'
+LEFT JOIN document_versions sup_v ON sup_v.version_id = sup.source_version_id
+LEFT JOIN documents sup_doc ON sup_doc.document_id = sup_v.document_id
+LEFT JOIN document_version_relations amd
+    ON amd.target_version_id = v.version_id AND amd.relation_type = 'amends'
+LEFT JOIN document_versions amd_v ON amd_v.version_id = amd.source_version_id
+LEFT JOIN documents amd_doc ON amd_doc.document_id = amd_v.document_id
 """
 
 # Ranh gioi quyen + hieu luc.
 # Dung chunk columns (denormalized) de filter truc tiep tai index.
 # NULL o valid_from lam dieu kien khong thoa -> loai (default-deny).
 _AUTHZ_WHERE = """
-WHERE c.owner_unit = ANY(%(units)s)
-  AND c.classification <= %(max_class)s
-  AND c.approved
-  AND c.status = ANY(%(doc_statuses)s)
-  AND c.valid_from IS NOT NULL
-  AND c.valid_from <= %(as_of)s
-  AND (c.valid_to IS NULL OR c.valid_to >= %(as_of)s)
+WHERE owner.unit_code = ANY(%(units)s)
+  AND c.is_active
+  AND v.classification <= %(max_class)s
+  AND v.approved
+  AND v.status = ANY(%(doc_statuses)s)
+  AND v.valid_from::date <= %(as_of)s
+  AND (v.valid_to IS NULL OR v.valid_to::date >= %(as_of)s)
 """
 
 # Luu y hieu nang: voi HNSW + filter, pgvector >= 0.8 nen bat `hnsw.iterative_scan`.
@@ -208,21 +214,27 @@ _KEYWORD_SQL = (
     + " ORDER BY kw_rank DESC LIMIT %(k)s"
 )
 
-# Mo rong theo supersedes/amends qua document_relations, cung bo loc quyen.
+# Mo rong theo supersedes/amends qua document_version_relations.
 _EXPAND_SQL = (
     _SELECT.format(extra_cols="")
     + _AUTHZ_WHERE
     + """
-  AND c.chunk_id <> ALL(%(known_chunk_ids)s)
+  AND c.chunk_id::text <> ALL(%(known_chunk_ids)s)
   AND (
-        c.document_id IN (
-            SELECT dr.source_document_id FROM document_relations dr
-            WHERE dr.target_document_id = ANY(%(doc_ids)s)
+        v.document_id IN (
+            SELECT related.document_id
+            FROM document_version_relations dr
+            JOIN document_versions related ON related.version_id = dr.source_version_id
+            JOIN documents related_doc ON related_doc.document_id = related.document_id
+            WHERE related_doc.document_code = ANY(%(doc_ids)s)
               AND dr.relation_type IN ('supersedes', 'amends')
         )
-        OR c.document_id IN (
-            SELECT dr.target_document_id FROM document_relations dr
-            WHERE dr.source_document_id = ANY(%(doc_ids)s)
+        OR v.document_id IN (
+            SELECT related.document_id
+            FROM document_version_relations dr
+            JOIN document_versions related ON related.version_id = dr.target_version_id
+            JOIN documents related_doc ON related_doc.document_id = related.document_id
+            WHERE related_doc.document_code = ANY(%(doc_ids)s)
               AND dr.relation_type IN ('supersedes', 'amends')
         )
   )
@@ -234,20 +246,24 @@ LIMIT %(k)s
 # Phat hien ban thay the/bo sung ma user KHONG duoc xem.
 # Chi tra ve document_id cua bang chung - khong tra noi dung cua ban an.
 _HIDDEN_SUCCESSOR_SQL = """
-SELECT DISTINCT dr.target_document_id AS document_id
-FROM document_relations dr
-JOIN documents successor ON successor.document_id = dr.source_document_id
-JOIN chunks c_succ ON c_succ.document_id = successor.document_id
-WHERE dr.target_document_id = ANY(%(doc_ids)s)
+SELECT DISTINCT target_doc.document_code AS document_id
+FROM document_version_relations dr
+JOIN document_versions target_v ON target_v.version_id = dr.target_version_id
+JOIN documents target_doc ON target_doc.document_id = target_v.document_id
+JOIN document_versions successor_v ON successor_v.version_id = dr.source_version_id
+JOIN documents successor ON successor.document_id = successor_v.document_id
+JOIN organization_units successor_owner ON successor_owner.unit_id = successor_v.owner_unit_id
+JOIN chunks c_succ ON c_succ.version_id = successor_v.version_id
+WHERE target_doc.document_code = ANY(%(doc_ids)s)
   AND dr.relation_type IN ('supersedes', 'amends')
-  AND successor.status = ANY(%(doc_statuses)s)
-  AND successor.approved
-  AND c_succ.valid_from IS NOT NULL
-  AND (c_succ.valid_from <= %(as_of)s)
-  AND (c_succ.valid_to IS NULL OR c_succ.valid_to >= %(as_of)s)
+  AND successor_v.status = ANY(%(doc_statuses)s)
+  AND successor_v.approved
+  AND c_succ.is_active
+  AND successor_v.valid_from::date <= %(as_of)s
+  AND (successor_v.valid_to IS NULL OR successor_v.valid_to::date >= %(as_of)s)
   AND (
-        successor.owner_unit = ANY(%(units)s)
-        AND successor.classification <= %(max_class)s
+        successor_owner.unit_code = ANY(%(units)s)
+        AND successor_v.classification <= %(max_class)s
   ) IS NOT TRUE
 """
 
@@ -326,7 +342,10 @@ class HybridRetriever:
         return {
             "units": list(scope.allowed_unit_ids),
             "max_class": scope.max_classification,
-            "doc_statuses": list(self._cfg.doc_statuses),
+            "doc_statuses": [
+                "published" if status == "active" else status
+                for status in self._cfg.doc_statuses
+            ],
             "as_of": as_of,
         }
 
