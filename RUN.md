@@ -73,7 +73,7 @@ Khởi tạo/cập nhật schema (lệnh này idempotent, không xóa dữ liệ
 python -m app.db init
 ```
 
-Schema tạo các bảng và role mặc định, không nạp tài khoản, đơn vị hay membership demo. Hãy provision cây đơn vị và tài khoản quản trị ban đầu bằng quy trình quản trị database của bạn; sau đó tạo tài khoản và cấp membership qua API quản trị. Không dùng `data/org.yaml` làm nguồn runtime.
+Schema tạo các bảng và role mặc định, không nạp tài khoản, đơn vị hay membership demo. Không dùng `data/org.yaml` làm nguồn runtime.
 
 Với database mới, tạo tài khoản quản trị cố định `admin` (email `admin@permission-aware-wiki.local`) bằng lệnh bootstrap. Mật khẩu được nhập ẩn, không truyền qua command line và phải dài ít nhất 12 ký tự:
 
@@ -81,7 +81,14 @@ Với database mới, tạo tài khoản quản trị cố định `admin` (emai
 python -m app.authz.bootstrap
 ```
 
-Lệnh này chỉ tạo tài khoản một lần, không ghi đè tài khoản `admin` hoặc khi đã có security admin active. Sau khi đăng nhập, có thể đổi mật khẩu qua `POST /api/v1/auth/change-password` bằng cách gửi `username_or_email`, `current_password` và `new_password` (ít nhất 12 ký tự). Sau đó thêm các đơn vị tổ chức còn lại vào `organization_units` và tạo user/membership tiếp theo qua API quản trị.
+Lệnh này chỉ tạo tài khoản một lần, không ghi đè tài khoản `admin` hoặc khi đã có security admin active. Sau khi đăng nhập Admin Portal:
+
+1. Tạo cây đơn vị trong mục **Cây đơn vị tổ chức**. Bootstrap đã tạo unit gốc `root`.
+2. Tạo tài khoản người dùng với membership/context và role ban đầu.
+3. Nếu cần, đồng bộ toàn bộ authorization model/tuples bằng seed (lệnh seed xóa store OpenFGA cùng tên trước khi tạo lại; không chạy trên dữ liệu cần giữ).
+4. Người dùng có thể tự đổi mật khẩu qua `POST /api/v1/auth/change-password`, gửi `username_or_email`, `current_password` và `new_password` (ít nhất 12 ký tự).
+
+Admin có thể đổi tên, parent và trạng thái unit; `unit_code` và `unit_type` không đổi sau khi tạo. Không thể ngừng unit còn child active hoặc membership còn hiệu lực. Thay đổi cây và membership thường ngày được đồng bộ qua outbox.
 
 Đồng bộ quan hệ ReBAC từ PostgreSQL sang OpenFGA (lệnh seed tạo lại store đã cấu hình):
 

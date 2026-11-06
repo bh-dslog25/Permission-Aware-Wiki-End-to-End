@@ -2,12 +2,17 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import {
   addAdminMembership,
   changeAdminMembershipRole,
+  createAdminOrganizationUnit,
   createAdminUser,
   fetchAdminDirectory,
+  fetchAdminOrganizationUnits,
   revokeAdminMembership,
+  updateAdminOrganizationUnit,
   setAdminUserStatus,
   type AdminDirectory,
   type AdminMembership,
+  type AdminOrganizationUnit,
+  type AdminOrganizationUnitType,
   type AdminUser,
   type User,
 } from "../api";
@@ -27,7 +32,75 @@ type MembershipForm = {
   membership_type: "primary" | "matrix" | "project";
 };
 
+type OrganizationUnitForm = {
+  unit_code: string;
+  name: string;
+  unit_type: AdminOrganizationUnitType;
+  parent_unit_code: string;
+  status: "active" | "inactive";
+};
+
+const unitTypeLabels: Record<AdminOrganizationUnitType, string> = {
+  group: "Tập đoàn / Group",
+  company: "Công ty",
+  division: "Khối / Division",
+  department: "Phòng ban / Department",
+  team: "Nhóm / Team",
+  project: "Dự án",
+  committee: "Ủy ban",
+};
+const allowedParentTypes: Record<AdminOrganizationUnitType, AdminOrganizationUnitType[]> = {
+  group: [],
+  company: ["group"],
+  division: ["company"],
+  department: ["company", "division"],
+  team: ["department"],
+  project: ["group", "company", "division", "department", "team"],
+  committee: ["group", "company", "division", "department", "team"],
+};
+
+function flattenOrganizationUnits(
+  units: AdminOrganizationUnit[],
+): Array<{ unit: AdminOrganizationUnit; depth: number }> {
+  const childrenByParent = new Map<string | null, AdminOrganizationUnit[]>();
+  for (const unit of units) {
+    const siblings = childrenByParent.get(unit.parent_unit_code) ?? [];
+    siblings.push(unit);
+    childrenByParent.set(unit.parent_unit_code, siblings);
+  }
+  for (const siblings of childrenByParent.values()) {
+    siblings.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  const result: Array<{ unit: AdminOrganizationUnit; depth: number }> = [];
+  const visited = new Set<string>();
+  const visit = (parentCode: string | null, depth: number) => {
+    for (const unit of childrenByParent.get(parentCode) ?? []) {
+      if (visited.has(unit.unit_code)) continue;
+      visited.add(unit.unit_code);
+      result.push({ unit, depth });
+      visit(unit.unit_code, depth + 1);
+    }
+  };
+  visit(null, 0);
+  for (const unit of units) {
+    if (!visited.has(unit.unit_code)) {
+      visited.add(unit.unit_code);
+      result.push({ unit, depth: 0 });
+      visit(unit.unit_code, 1);
+    }
+  }
+  return result;
+}
+
 const emptyDirectory: AdminDirectory = { items: [], units: [], roles: [] };
+const emptyOrganizationUnit: OrganizationUnitForm = {
+  unit_code: "",
+  name: "",
+  unit_type: "company",
+  parent_unit_code: "",
+  status: "active",
+};
 const emptyMembership: MembershipForm = {
   context_id: "",
   unit_code: "",
@@ -40,38 +113,45 @@ const inputClass =
 
 export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
   const [directory, setDirectory] = useState<AdminDirectory>(emptyDirectory);
+  const [organizationUnits, setOrganizationUnits] = useState<AdminOrganizationUnit[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [unitDialog, setUnitDialog] = useState<AdminOrganizationUnit | "create" | null>(null);
+  const [unitForm, setUnitForm] = useState<OrganizationUnitForm>(emptyOrganizationUnit);
   const [membershipFor, setMembershipFor] = useState<string | null>(null);
   const [newUser, setNewUser] = useState({
     user_code: "",
     display_name: "",
     email: "",
     password: "",
-    job_title: "",
     ...emptyMembership,
   });
   const [newMembership, setNewMembership] = useState<MembershipForm>(emptyMembership);
 
-  const loadDirectory = useCallback(async () => {
+  const loadAdminData = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      setDirectory(await fetchAdminDirectory(user.id));
+      const [nextDirectory, nextUnits] = await Promise.all([
+        fetchAdminDirectory(user.id),
+        fetchAdminOrganizationUnits(user.id),
+      ]);
+      setDirectory(nextDirectory);
+      setOrganizationUnits(nextUnits);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Không tải được danh sách nhân viên.");
+      setError(loadError instanceof Error ? loadError.message : "Không tải được dữ liệu quản trị.");
     } finally {
       setLoading(false);
     }
   }, [user.id]);
 
   useEffect(() => {
-    void loadDirectory();
-  }, [loadDirectory]);
+    void loadAdminData();
+  }, [loadAdminData]);
 
   useEffect(() => {
     if (directory.units.length && !newUser.unit_code) {
@@ -100,7 +180,7 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
     setNotice("");
     try {
       await action();
-      await loadDirectory();
+      await loadAdminData();
       setNotice(successMessage);
       return true;
     } catch (actionError) {
@@ -124,7 +204,6 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
       display_name: "",
       email: "",
       password: "",
-      job_title: "",
       ...emptyMembership,
       unit_code: directory.units[0]?.unit_code ?? "",
       role_code: directory.roles.find((role) => role.role_code === "employee")?.role_code ?? "",
@@ -146,6 +225,59 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
     });
   }
 
+  function openCreateUnit() {
+    setUnitForm({
+      ...emptyOrganizationUnit,
+      parent_unit_code: organizationUnits.find(
+        (unit) => unit.unit_type === "group" && unit.status === "active",
+      )?.unit_code ?? "",
+    });
+    setUnitDialog("create");
+  }
+
+  function openEditUnit(unit: AdminOrganizationUnit) {
+    setUnitForm({
+      unit_code: unit.unit_code,
+      name: unit.name,
+      unit_type: unit.unit_type,
+      parent_unit_code: unit.parent_unit_code ?? "",
+      status: unit.status,
+    });
+    setUnitDialog(unit);
+  }
+
+  async function handleSaveUnit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const isCreating = unitDialog === "create";
+    const succeeded = await runAction(
+      () =>
+        isCreating
+          ? createAdminOrganizationUnit(user.id, {
+              unit_code: unitForm.unit_code,
+              name: unitForm.name,
+              unit_type: unitForm.unit_type,
+              parent_unit_code: unitForm.parent_unit_code || null,
+            })
+          : updateAdminOrganizationUnit(user.id, unitForm.unit_code, {
+              name: unitForm.name,
+              parent_unit_code: unitForm.parent_unit_code || null,
+              status: unitForm.status,
+            }),
+      isCreating
+        ? `Đã tạo đơn vị ${unitForm.name}.`
+        : `Đã cập nhật đơn vị ${unitForm.name}.`,
+    );
+    if (succeeded) setUnitDialog(null);
+  }
+
+  const orderedUnits = flattenOrganizationUnits(organizationUnits);
+  const selectableParents = organizationUnits.filter(
+    (unit) =>
+      unit.status === "active" &&
+      allowedParentTypes[unitForm.unit_type].includes(unit.unit_type) &&
+      unit.unit_code !== unitForm.unit_code,
+  );
+
   const filteredUsers = directory.items.filter((item) =>
     `${item.user_code} ${item.display_name} ${item.email}`
       .toLocaleLowerCase()
@@ -162,7 +294,7 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
           <div>
             <p className="text-sm font-bold">Appota Knowledge</p>
             <p className="text-[10px] font-semibold uppercase tracking-wider text-[#7b857d]">
-              Quản trị tài khoản và phân quyền
+              Quản trị tổ chức, tài khoản và phân quyền
             </p>
           </div>
         </div>
@@ -205,6 +337,69 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
             {error || notice}
           </div>
         )}
+
+        <section className="mt-7 overflow-hidden rounded-2xl border border-[#e0e5e0] bg-white shadow-sm">
+          <div className="flex flex-col gap-3 border-b border-[#edf0ed] p-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div>
+              <h2 className="font-bold">Cây đơn vị tổ chức ({organizationUnits.length})</h2>
+              <p className="mt-1 text-xs text-[#818a83]">
+                Tạo đơn vị và cập nhật tên, đơn vị cha hoặc trạng thái. Mã và loại đơn vị không đổi sau khi tạo.
+              </p>
+            </div>
+            <button
+              className="h-10 rounded-lg bg-[#165c3a] px-4 text-sm font-bold text-white hover:bg-[#104e31] disabled:opacity-60"
+              disabled={saving}
+              onClick={openCreateUnit}
+              type="button"
+            >
+              + Tạo đơn vị
+            </button>
+          </div>
+          {loading ? (
+            <p className="p-6 text-center text-sm text-[#7c857e]">Đang tải cây đơn vị...</p>
+          ) : organizationUnits.length === 0 ? (
+            <p className="p-6 text-center text-sm text-[#7c857e]">Chưa có organization unit.</p>
+          ) : (
+            <div className="divide-y divide-[#edf0ed]">
+              {orderedUnits.map(({ unit, depth }) => (
+                <div
+                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6"
+                  key={unit.unit_code}
+                >
+                  <div className="min-w-0" style={{ paddingLeft: `${depth * 18}px` }}>
+                    <p className="truncate text-sm font-semibold text-[#27332a]">
+                      {unit.name}
+                      <span className="ml-2 font-normal text-[#7b857d]">{unit.unit_code}</span>
+                    </p>
+                    <p className="mt-1 text-xs text-[#818a83]">
+                      {unitTypeLabels[unit.unit_type]}
+                      {unit.parent_name ? ` · Thuộc ${unit.parent_name}` : " · Đơn vị gốc"}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                        unit.status === "active"
+                          ? "bg-[#eaf5ed] text-[#276342]"
+                          : "bg-[#f0f1ef] text-[#68736a]"
+                      }`}
+                    >
+                      {unit.status === "active" ? "Đang hoạt động" : "Ngừng hoạt động"}
+                    </span>
+                    <button
+                      className="rounded-lg border border-[#dce4dd] px-3 py-2 text-xs font-semibold text-[#326247] hover:bg-[#f4f8f4]"
+                      disabled={saving}
+                      onClick={() => openEditUnit(unit)}
+                      type="button"
+                    >
+                      Chỉnh sửa
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
 
         <section className="mt-7 overflow-hidden rounded-2xl border border-[#e0e5e0] bg-white shadow-sm">
           <div className="flex flex-col gap-3 border-b border-[#edf0ed] p-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
@@ -318,6 +513,149 @@ export default function AdminPortal({ user, onBackToChat, onLogout }: Props) {
             <div className="mt-6 flex justify-end gap-2">
               <button className="h-10 rounded-lg px-4 text-sm font-semibold text-[#667168] hover:bg-[#f1f3f0]" onClick={() => setCreateOpen(false)} type="button">Hủy</button>
               <button className="h-10 rounded-lg bg-[#165c3a] px-5 text-sm font-bold text-white disabled:opacity-60" disabled={saving || !directory.units.length || !directory.roles.length} type="submit">{saving ? "Đang lưu..." : "Tạo tài khoản"}</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {unitDialog && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center overflow-y-auto bg-[#172019]/40 p-4">
+          <form
+            className="my-auto w-full max-w-xl rounded-2xl bg-white p-6 shadow-xl"
+            onSubmit={(event) => void handleSaveUnit(event)}
+          >
+            <div className="flex items-start justify-between">
+              <div>
+                <h2 className="text-xl font-bold">
+                  {unitDialog === "create" ? "Tạo organization unit" : "Chỉnh sửa organization unit"}
+                </h2>
+                <p className="mt-1 text-sm text-[#788179]">
+                  Đơn vị cha phải đúng cấp; không thể ngừng đơn vị còn đơn vị con hoặc membership active.
+                </p>
+              </div>
+              <button
+                aria-label="Đóng"
+                className="rounded-lg px-3 py-1 text-xl text-[#68736a] hover:bg-[#f1f3f0]"
+                onClick={() => setUnitDialog(null)}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              {unitDialog === "create" ? (
+                <>
+                  <label className="text-xs font-semibold text-[#556058]">
+                    Mã đơn vị
+                    <input
+                      className={inputClass}
+                      maxLength={50}
+                      onChange={(event) => setUnitForm({ ...unitForm, unit_code: event.target.value })}
+                      pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]*"
+                      required
+                      value={unitForm.unit_code}
+                    />
+                  </label>
+                  <label className="text-xs font-semibold text-[#556058]">
+                    Loại đơn vị
+                    <select
+                      className={inputClass}
+                      onChange={(event) => {
+                        const unitType = event.target.value as AdminOrganizationUnitType;
+                        const firstParent = organizationUnits.find(
+                          (unit) =>
+                            unit.status === "active" &&
+                            allowedParentTypes[unitType].includes(unit.unit_type),
+                        );
+                        setUnitForm({
+                          ...unitForm,
+                          unit_type: unitType,
+                          parent_unit_code: firstParent?.unit_code ?? "",
+                        });
+                      }}
+                      value={unitForm.unit_type}
+                    >
+                      {Object.entries(unitTypeLabels).map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              ) : (
+                <div className="text-xs font-semibold text-[#556058]">
+                  Mã / loại đơn vị
+                  <p className="mt-2 text-sm font-normal text-[#68736a]">
+                    {unitForm.unit_code} · {unitTypeLabels[unitForm.unit_type]}
+                  </p>
+                </div>
+              )}
+              <label className="text-xs font-semibold text-[#556058] sm:col-span-2">
+                Tên đơn vị
+                <input
+                  className={inputClass}
+                  maxLength={150}
+                  onChange={(event) => setUnitForm({ ...unitForm, name: event.target.value })}
+                  required
+                  value={unitForm.name}
+                />
+              </label>
+              <label className="text-xs font-semibold text-[#556058] sm:col-span-2">
+                Đơn vị cha
+                <select
+                  className={inputClass}
+                  onChange={(event) => setUnitForm({ ...unitForm, parent_unit_code: event.target.value })}
+                  required={unitForm.unit_type !== "group"}
+                  value={unitForm.parent_unit_code}
+                >
+                  {unitForm.unit_type === "group" && <option value="">Không có (đơn vị gốc)</option>}
+                  {selectableParents.map((unit) => (
+                    <option key={unit.unit_code} value={unit.unit_code}>
+                      {unit.name} · {unitTypeLabels[unit.unit_type]}
+                    </option>
+                  ))}
+                  {unitDialog !== "create" &&
+                    unitForm.parent_unit_code &&
+                    !selectableParents.some((unit) => unit.unit_code === unitForm.parent_unit_code) && (
+                      <option value={unitForm.parent_unit_code}>
+                        {unitDialog.parent_name ?? unitForm.parent_unit_code} · parent hiện tại
+                      </option>
+                    )}
+                </select>
+              </label>
+              {unitDialog !== "create" && (
+                <label className="text-xs font-semibold text-[#556058] sm:col-span-2">
+                  Trạng thái
+                  <select
+                    className={inputClass}
+                    onChange={(event) =>
+                      setUnitForm({
+                        ...unitForm,
+                        status: event.target.value as OrganizationUnitForm["status"],
+                      })
+                    }
+                    value={unitForm.status}
+                  >
+                    <option value="active">Đang hoạt động</option>
+                    <option value="inactive">Ngừng hoạt động</option>
+                  </select>
+                </label>
+              )}
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                className="h-10 rounded-lg px-4 text-sm font-semibold text-[#667168] hover:bg-[#f1f3f0]"
+                onClick={() => setUnitDialog(null)}
+                type="button"
+              >
+                Hủy
+              </button>
+              <button
+                className="h-10 rounded-lg bg-[#165c3a] px-5 text-sm font-bold text-white disabled:opacity-60"
+                disabled={saving}
+                type="submit"
+              >
+                {saving ? "Đang lưu..." : "Lưu"}
+              </button>
             </div>
           </form>
         </div>

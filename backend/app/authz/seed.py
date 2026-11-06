@@ -151,6 +151,12 @@ def process_outbox(api_url: str | None = None) -> dict[str, int]:
             if event_type == "user_membership_created":
                 tuples = [payload]
                 body = {"writes": {"tuple_keys": tuples}}
+            elif event_type == "organization_unit_relations_changed":
+                body = {}
+                if payload.get("writes"):
+                    body["writes"] = {"tuple_keys": payload["writes"]}
+                if payload.get("deletes"):
+                    body["deletes"] = {"tuple_keys": payload["deletes"]}
             elif event_type == "user_status_changed":
                 tuples = [
                     {"user": payload["user"], "relation": "assigned", "object": f"unit:{unit}"}

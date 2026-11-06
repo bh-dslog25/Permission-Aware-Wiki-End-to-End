@@ -57,6 +57,96 @@ class UpdateMembershipRequest(BaseModel):
     role_code: str = Field(min_length=1, max_length=50)
 
 
+OrganizationUnitType = Literal[
+    "group", "company", "division", "department", "team", "project", "committee"
+]
+
+
+class CreateOrganizationUnitRequest(BaseModel):
+    unit_code: str = Field(min_length=1, max_length=50, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+    name: str = Field(min_length=1, max_length=150)
+    unit_type: OrganizationUnitType
+    parent_unit_code: str | None = Field(default=None, max_length=50)
+
+
+class UpdateOrganizationUnitRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    parent_unit_code: str | None = Field(default=None, max_length=50)
+    status: Literal["active", "inactive"] | None = None
+
+
+_ALLOWED_UNIT_PARENTS: dict[str, set[str]] = {
+    "group": set(),
+    "company": {"group"},
+    "division": {"company"},
+    "department": {"company", "division"},
+    "team": {"department"},
+    "project": {"group", "company", "division", "department", "team"},
+    "committee": {"group", "company", "division", "department", "team"},
+}
+
+
+def _validate_unit_parent(unit_type: str, parent_type: str | None) -> None:
+    allowed_parents = _ALLOWED_UNIT_PARENTS[unit_type]
+    if parent_type is None:
+        if unit_type != "group":
+            raise HTTPException(status_code=422, detail="Chỉ đơn vị group mới có thể không có parent")
+        return
+    if parent_type not in allowed_parents:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Parent loại '{parent_type}' không hợp lệ cho đơn vị '{unit_type}'",
+        )
+
+
+def _enqueue_unit_relation_sync(conn, relations: dict[str, list[dict[str, str]]]) -> None:
+    if not relations["writes"] and not relations["deletes"]:
+        return
+    conn.execute(
+        """
+        INSERT INTO authz_outbox (idempotency_key, event_type, tuple_payload)
+        VALUES (%s, 'organization_unit_relations_changed', %s)
+        """,
+        (f"organization-unit:{uuid4()}", Jsonb(relations)),
+    )
+
+
+def _lock_organization_tree(conn) -> None:
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('permission-aware-wiki-organization-tree'))"
+    )
+
+
+def _unit_relation_payload(
+    *,
+    unit_code: str,
+    old_parent_code: str | None,
+    new_parent_code: str | None,
+    old_status: str,
+    new_status: str,
+) -> dict[str, list[dict[str, str]]]:
+    def tuple_for(parent_code: str) -> dict[str, str]:
+        return {
+            "user": f"unit:{unit_code}",
+            "relation": "child",
+            "object": f"unit:{parent_code}",
+        }
+
+    deletes = (
+        [tuple_for(old_parent_code)]
+        if old_parent_code and old_status == "active"
+        else []
+    )
+    writes = (
+        [tuple_for(new_parent_code)]
+        if new_parent_code and new_status == "active"
+        else []
+    )
+    if deletes == writes:
+        return {"writes": [], "deletes": []}
+    return {"writes": writes, "deletes": deletes}
+
+
 def _admin_actor(x_persona_id: str | None) -> str:
     if not x_persona_id:
         raise HTTPException(status_code=401, detail="Yêu cầu đăng nhập")
@@ -85,7 +175,7 @@ def _admin_actor(x_persona_id: str | None) -> str:
             (actor.user_id,),
         ).fetchone()[0]
     if not is_security:
-        raise HTTPException(status_code=403, detail="Chỉ security được quản lý tài khoản")
+        raise HTTPException(status_code=403, detail="Chỉ security được phép quản trị")
     return actor.user_id
 
 
@@ -137,7 +227,11 @@ def create_user(
     try:
         with get_conn() as conn, conn.transaction():
             unit = conn.execute(
-                "SELECT unit_id FROM organization_units WHERE unit_code = %s AND status = 'active'",
+                """
+                SELECT unit_id FROM organization_units
+                WHERE unit_code = %s AND status = 'active'
+                FOR SHARE
+                """,
                 (payload.unit_code,),
             ).fetchone()
             role = conn.execute(
@@ -289,6 +383,263 @@ def list_users(
     }
 
 
+@router.get("/organization-units")
+def list_organization_units(
+    x_persona_id: str | None = Header(default=None, alias="X-Persona-Id"),
+) -> dict:
+    _admin_actor(x_persona_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT child.unit_code, child.name, child.unit_type, child.status,
+                   parent.unit_code AS parent_unit_code, parent.name AS parent_name
+            FROM organization_units child
+            LEFT JOIN organization_units parent ON parent.unit_id = child.parent_unit_id
+            ORDER BY child.unit_type, child.name, child.unit_code
+            """
+        ).fetchall()
+    return {
+        "items": [
+            {
+                "unit_code": row[0],
+                "name": row[1],
+                "unit_type": row[2],
+                "status": row[3],
+                "parent_unit_code": row[4],
+                "parent_name": row[5],
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.post("/organization-units", status_code=201)
+def create_organization_unit(
+    payload: CreateOrganizationUnitRequest,
+    x_persona_id: str | None = Header(default=None, alias="X-Persona-Id"),
+) -> dict:
+    actor_id = _admin_actor(x_persona_id)
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="Tên organization unit không được để trống")
+    parent_id = None
+    parent_type = None
+    with get_conn() as conn, conn.transaction():
+        _lock_organization_tree(conn)
+        if payload.parent_unit_code is not None:
+            parent = conn.execute(
+                """
+                SELECT unit_id, unit_type
+                FROM organization_units
+                WHERE unit_code = %s AND status = 'active'
+                FOR SHARE
+                """,
+                (payload.parent_unit_code,),
+            ).fetchone()
+            if parent is None:
+                raise HTTPException(status_code=422, detail="Đơn vị cha không tồn tại hoặc đã ngừng hoạt động")
+            parent_id, parent_type = parent
+        _validate_unit_parent(payload.unit_type, parent_type)
+        try:
+            conn.execute(
+                """
+                INSERT INTO organization_units (unit_code, name, unit_type, parent_unit_id)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (payload.unit_code, payload.name.strip(), payload.unit_type, parent_id),
+            )
+        except UniqueViolation as exc:
+            raise HTTPException(status_code=409, detail="Mã organization unit đã tồn tại") from exc
+
+        relations = _unit_relation_payload(
+            unit_code=payload.unit_code,
+            old_parent_code=None,
+            new_parent_code=payload.parent_unit_code,
+            old_status="inactive",
+            new_status="active",
+        )
+        _enqueue_unit_relation_sync(conn, relations)
+        write_audit(
+            conn,
+            actor_id,
+            context_unit=payload.unit_code,
+            structured_query={
+                "type": "organization_unit_created",
+                "unit_code": payload.unit_code,
+                "unit_type": payload.unit_type,
+                "parent_unit_code": payload.parent_unit_code,
+            },
+            authz_decision={"action": "create_organization_unit", "decision": "success"},
+            outcome="answered",
+        )
+
+    sync_status = _sync_authz_outbox() if relations["writes"] else "not_needed"
+    return {
+        "unit_code": payload.unit_code,
+        "name": payload.name.strip(),
+        "unit_type": payload.unit_type,
+        "parent_unit_code": payload.parent_unit_code,
+        "status": "active",
+        "authorization_sync": sync_status,
+    }
+
+
+@router.patch("/organization-units/{unit_code}")
+def update_organization_unit(
+    unit_code: str,
+    payload: UpdateOrganizationUnitRequest,
+    x_persona_id: str | None = Header(default=None, alias="X-Persona-Id"),
+) -> dict:
+    actor_id = _admin_actor(x_persona_id)
+    fields = payload.model_fields_set
+    with get_conn() as conn, conn.transaction():
+        _lock_organization_tree(conn)
+        unit = conn.execute(
+            """
+            SELECT child.unit_id, child.name, child.unit_type, child.status,
+                   child.parent_unit_id, parent.unit_code, parent.unit_type, parent.status
+            FROM organization_units child
+            LEFT JOIN organization_units parent ON parent.unit_id = child.parent_unit_id
+            WHERE child.unit_code = %s
+            FOR UPDATE OF child
+            """,
+            (unit_code,),
+        ).fetchone()
+        if unit is None:
+            raise HTTPException(status_code=404, detail="Organization unit không tồn tại")
+
+        unit_id, old_name, unit_type, old_status, old_parent_id, old_parent_code, old_parent_type, old_parent_status = unit
+        if not fields:
+            return {
+                "unit_code": unit_code,
+                "name": old_name,
+                "unit_type": unit_type,
+                "parent_unit_code": old_parent_code,
+                "status": old_status,
+                "authorization_sync": "not_needed",
+            }
+        if "name" in fields and payload.name is None:
+            raise HTTPException(status_code=422, detail="Tên organization unit không được để trống")
+        if "status" in fields and payload.status is None:
+            raise HTTPException(status_code=422, detail="Trạng thái organization unit không hợp lệ")
+
+        new_name = payload.name.strip() if "name" in fields and payload.name is not None else old_name
+        if "name" in fields and not new_name:
+            raise HTTPException(status_code=422, detail="Tên organization unit không được để trống")
+        new_status = payload.status if "status" in fields and payload.status is not None else old_status
+        parent_changed = (
+            "parent_unit_code" in fields and payload.parent_unit_code != old_parent_code
+        )
+        new_parent_code = payload.parent_unit_code if parent_changed else old_parent_code
+        new_parent_id = old_parent_id
+        new_parent_type = old_parent_type
+        new_parent_status = old_parent_status
+
+        should_validate_parent = parent_changed or (new_status == "active" and old_status != "active")
+        if should_validate_parent:
+            new_parent_id = None
+            new_parent_type = None
+            new_parent_status = None
+            if new_parent_code is not None:
+                parent = conn.execute(
+                    """
+                    SELECT unit_id, unit_type, status
+                    FROM organization_units
+                    WHERE unit_code = %s
+                    FOR SHARE
+                    """,
+                    (new_parent_code,),
+                ).fetchone()
+                if parent is None or parent[2] != "active":
+                    raise HTTPException(status_code=422, detail="Đơn vị cha không tồn tại hoặc đã ngừng hoạt động")
+                new_parent_id, new_parent_type, new_parent_status = parent
+            _validate_unit_parent(unit_type, new_parent_type)
+            if new_parent_id is not None:
+                is_descendant = conn.execute(
+                    """
+                    WITH RECURSIVE descendants(unit_id) AS (
+                        SELECT %s::uuid
+                        UNION
+                        SELECT child.unit_id
+                        FROM organization_units child
+                        JOIN descendants parent ON child.parent_unit_id = parent.unit_id
+                    )
+                    SELECT EXISTS (
+                        SELECT 1 FROM descendants WHERE unit_id = %s
+                    )
+                    """,
+                    (unit_id, new_parent_id),
+                ).fetchone()[0]
+                if is_descendant:
+                    raise HTTPException(status_code=422, detail="Không thể chuyển đơn vị xuống dưới đơn vị con của nó")
+
+        if new_status == "inactive" and old_status != "inactive":
+            has_active_children = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM organization_units
+                    WHERE parent_unit_id = %s AND status = 'active'
+                )
+                """,
+                (unit_id,),
+            ).fetchone()[0]
+            has_active_memberships = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM memberships
+                    WHERE unit_id = %s AND status = 'active'
+                      AND valid_from <= now() AND (valid_to IS NULL OR valid_to > now())
+                )
+                """,
+                (unit_id,),
+            ).fetchone()[0]
+            if has_active_children or has_active_memberships:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Không thể ngừng hoạt động khi đơn vị còn đơn vị con hoặc membership đang hoạt động",
+                )
+
+        conn.execute(
+            """
+            UPDATE organization_units
+            SET name = %s, parent_unit_id = %s, status = %s
+            WHERE unit_id = %s
+            """,
+            (new_name, new_parent_id, new_status, unit_id),
+        )
+        relations = _unit_relation_payload(
+            unit_code=unit_code,
+            old_parent_code=old_parent_code,
+            new_parent_code=new_parent_code,
+            old_status=old_status,
+            new_status=new_status,
+        )
+        _enqueue_unit_relation_sync(conn, relations)
+        write_audit(
+            conn,
+            actor_id,
+            context_unit=unit_code,
+            structured_query={
+                "type": "organization_unit_updated",
+                "unit_code": unit_code,
+                "name": new_name,
+                "parent_unit_code": new_parent_code,
+                "status": new_status,
+            },
+            authz_decision={"action": "update_organization_unit", "decision": "success"},
+            outcome="answered",
+        )
+
+    sync_status = _sync_authz_outbox() if relations["writes"] or relations["deletes"] else "not_needed"
+    return {
+        "unit_code": unit_code,
+        "name": new_name,
+        "unit_type": unit_type,
+        "parent_unit_code": new_parent_code,
+        "status": new_status,
+        "authorization_sync": sync_status,
+    }
+
+
 @router.post("/users/{user_code}/memberships", status_code=201)
 def create_membership(
     user_code: str,
@@ -303,7 +654,11 @@ def create_membership(
                 (user_code,),
             ).fetchone()
             unit = conn.execute(
-                "SELECT unit_id FROM organization_units WHERE unit_code = %s AND status = 'active'",
+                """
+                SELECT unit_id FROM organization_units
+                WHERE unit_code = %s AND status = 'active'
+                FOR SHARE
+                """,
                 (payload.unit_code,),
             ).fetchone()
             role = conn.execute(

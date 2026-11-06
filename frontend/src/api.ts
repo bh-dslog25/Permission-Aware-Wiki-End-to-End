@@ -254,6 +254,22 @@ export async function authenticate(identifier: string, password: string): Promis
 
 export type AdminRole = { role_code: string; role_name: string };
 export type AdminUnit = { unit_code: string; name: string };
+export type AdminOrganizationUnitType =
+  | "group"
+  | "company"
+  | "division"
+  | "department"
+  | "team"
+  | "project"
+  | "committee";
+export type AdminOrganizationUnit = {
+  unit_code: string;
+  name: string;
+  unit_type: AdminOrganizationUnitType;
+  status: "active" | "inactive";
+  parent_unit_code: string | null;
+  parent_name?: string | null;
+};
 export type AdminMembership = {
   membership_id: string;
   context_id: string;
@@ -301,6 +317,47 @@ async function adminRequest<T>(
 
 export function fetchAdminDirectory(userId: string): Promise<AdminDirectory> {
   return adminRequest<AdminDirectory>("/users", userId);
+}
+
+export async function fetchAdminOrganizationUnits(
+  userId: string,
+): Promise<AdminOrganizationUnit[]> {
+  const result = await adminRequest<{ items: AdminOrganizationUnit[] }>(
+    "/organization-units",
+    userId,
+  );
+  return result.items;
+}
+
+export function createAdminOrganizationUnit(
+  userId: string,
+  payload: {
+    unit_code: string;
+    name: string;
+    unit_type: AdminOrganizationUnitType;
+    parent_unit_code: string | null;
+  },
+): Promise<AdminOrganizationUnit> {
+  return adminRequest("/organization-units", userId, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateAdminOrganizationUnit(
+  userId: string,
+  unitCode: string,
+  payload: {
+    name: string;
+    parent_unit_code: string | null;
+    status: "active" | "inactive";
+  },
+): Promise<AdminOrganizationUnit> {
+  return adminRequest(
+    `/organization-units/${encodeURIComponent(unitCode)}`,
+    userId,
+    { method: "PATCH", body: JSON.stringify(payload) },
+  );
 }
 
 export function createAdminUser(
